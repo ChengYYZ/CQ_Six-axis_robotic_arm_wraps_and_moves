@@ -1,0 +1,6 @@
+{
+  "model": "epg",
+  "port": "COM3",
+  "baud_rate": 115200,
+  "slave_id": 9
+}

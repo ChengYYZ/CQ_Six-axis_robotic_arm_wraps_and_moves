@@ -1,0 +1,100 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.json
+config.json
+!config.example.json
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# Codex/agent-local metadata
+.agents/
+.codex/
+
+# Logs, runtime state, and temporary files
+*.log
+*.log.*
+logs/
+Log/
+_rokae_log_/
+tmp/
+temp/
+*.tmp
+*.bak
+*.pid
+
+# Calibration captures and generated workspace data
+calibration_suite/workspace/
+
+# Ultralytics/YOLO generated output and local cache
+runs/
+Ultralytics/
+**/Ultralytics/settings.json
+**/Ultralytics/persistent_cache.json
+
+# Model checkpoints are large; publish them with Git LFS or GitHub Releases
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+
+# Local inspection/extraction scratch data
+_inspect_python_rar/
+
+# CMake and native build output
+cmake-build-*/
+build-ninja/
+build-nmake/
+build-vs/
+build-vs2/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.obj
+*.exp
+*.ilk
+*.pdb
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MobileCLIP large model
+/mobileclip_blt.ts

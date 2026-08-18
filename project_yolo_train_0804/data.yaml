@@ -1,0 +1,9 @@
+path: C:\Users\ASUS\Desktop\YOLO0804\8.4
+
+train: images/train
+val: images/val
+
+names:
+  0: parcel_box
+  1: document_envelope
+  2: soft_parcel

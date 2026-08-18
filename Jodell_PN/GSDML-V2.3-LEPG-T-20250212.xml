@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<ISO15745Profile xmlns="http://www.profibus.com/GSDML/2003/11/DeviceProfile" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.profibus.com/GSDML/2003/11/DeviceProfile ..\xsd\GSDML-DeviceProfile-V2.3.xsd">
+  <ProfileHeader>
+    <ProfileIdentification>PROFINET Device Profile</ProfileIdentification>
+    <ProfileRevision>1.00</ProfileRevision>
+    <ProfileName>Device Profile for PROFINET Devices</ProfileName>
+    <ProfileSource>PROFIBUS Nutzerorganisation e. V. (PNO)</ProfileSource>
+    <ProfileClassID>Device</ProfileClassID>
+    <ISO15745Reference>
+      <ISO15745Part>4</ISO15745Part>
+      <ISO15745Edition>1</ISO15745Edition>
+      <ProfileTechnology>GSDML</ProfileTechnology>
+    </ISO15745Reference>
+  </ProfileHeader>
+  <ProfileBody>
+    <DeviceIdentity VendorID="0xefff" DeviceID="0x5400">
+      <InfoText TextId="ProfiNet IO module" />
+      <VendorName Value="Jodell.cn" />
+    </DeviceIdentity>
+    <DeviceFunction>
+      <Family MainFamily="I/O" ProductFamily="Jodell" />
+    </DeviceFunction>
+    <ApplicationProcess>
+      <DeviceAccessPointList>
+        <DeviceAccessPointItem ID="00052" PhysicalSlots="0..2" ModuleIdentNumber="0x0001" MinDeviceInterval="32" ImplementationType="PN-UART" DNS_CompatibleName="pn-uart" FixedInSlots="0" ObjectUUID_LocalIndex="1" PowerOnToCommReady="0" ParameterizationSpeedupSupported="true" MultipleWriteSupported="false" DeviceAccessSupported="true" NameOfStationNotTransferable="true" PNIO_Version="V2.3">
+          <!-- TBD: Set PNIO_Version to the PROFINET IO version that this device is based on -->
+          <ModuleInfo>
+            <Name TextId="PN-UART X2" />
+            <InfoText TextId="InfoText" />
+            <Family MainFamily="I/O" ProductFamily="IC1" />
+            <VendorName Value="Jodell.cn" />
+            <OrderNumber Value="00052" />
+            <HardwareRelease Value="1" />
+            <SoftwareRelease Value="2" />
+          </ModuleInfo>
+          <SubslotList>
+            <SubslotItem SubslotNumber="32768" TextId="IDT_SS_Interface" />
+            <SubslotItem SubslotNumber="32769" TextId="IDT_SS_Port1" />
+            <SubslotItem SubslotNumber="32770" TextId="IDT_SS_Port2" />
+          </SubslotList>
+          <IOConfigData MaxInputLength="500" MaxOutputLength="500" />
+          <UseableModules>
+            <ModuleItemRef ModuleItemTarget="Output" FixedInSlots="1" />
+            <ModuleItemRef ModuleItemTarget="Input" FixedInSlots="2" />
+          </UseableModules>
+          <SystemDefinedSubmoduleList>
+            <InterfaceSubmoduleItem ID="Subitem_1" SupportedRT_Class="Class1" SupportedProtocols="LLDP" SupportedMibs="MIB2" NetworkComponentDiagnosisSupported="true" SubslotNumber="32768" TextId="Modue_Name_1" SubmoduleIdentNumber="0x00000002">
+              <ApplicationRelations>
+                <TimingProperties SendClock="32 64 128" />
+              </ApplicationRelations>
+            </InterfaceSubmoduleItem>
+            <PortSubmoduleItem ID="Subitem_1a" SubslotNumber="32769" MaxPortRxDelay="350" MaxPortTxDelay="158" LinkStateDiagnosisCapability="Up+Down" TextId="IDT_Port1" SubmoduleIdentNumber="0x00000003" MAUType="100BASETXFD" />
+            <PortSubmoduleItem ID="Subitem_1b" SubslotNumber="32770" MaxPortRxDelay="350" MaxPortTxDelay="158" LinkStateDiagnosisCapability="Up+Down" TextId="IDT_Port2" SubmoduleIdentNumber="0x00000004" MAUType="100BASETXFD" />
+          </SystemDefinedSubmoduleList>
+          <Graphics>
+            <GraphicItemRef Type="DeviceSymbol" GraphicItemTarget="1" />
+          </Graphics>
+        </DeviceAccessPointItem>
+      </DeviceAccessPointList>
+      <ModuleList>
+        <ModuleItem ID="Output" ModuleIdentNumber="0x05">
+          <ModuleInfo>
+            <Name TextId="Output_Text" />
+            <InfoText TextId="Output Module." />
+          </ModuleInfo>
+          <VirtualSubmoduleList>
+            <VirtualSubmoduleItem ID="Output" SubmoduleIdentNumber="0x05">
+              <IOData IOPS_Length="1" IOCS_Length="1" >
+                <Output>
+                  <DataItem DataType="OctetString" Length="23" UseAsBits="true" TextId="Output" />
+                </Output>
+              </IOData>
+              <ModuleInfo>
+                <Name TextId="Output_Text" />
+                <InfoText TextId="Output Module." />
+              </ModuleInfo>
+            </VirtualSubmoduleItem>
+          </VirtualSubmoduleList>
+        </ModuleItem>
+        <ModuleItem ID="Input" ModuleIdentNumber="0x06">
+          <ModuleInfo>
+            <Name TextId="Input_Text" />
+            <InfoText TextId="Input Module." />
+          </ModuleInfo>
+          <VirtualSubmoduleList>
+            <VirtualSubmoduleItem ID="Input" SubmoduleIdentNumber="0x06">
+              <IOData IOPS_Length="1" IOCS_Length="1">
+                <Input>
+                  <DataItem DataType="OctetString" Length="20" UseAsBits="true" TextId="Input" />
+                </Input>
+              </IOData>
+              <ModuleInfo>
+                <Name TextId="Input_Text" />
+                <InfoText TextId="Input Module." />
+              </ModuleInfo>
+            </VirtualSubmoduleItem>
+          </VirtualSubmoduleList>
+        </ModuleItem>
+      </ModuleList>   
+      <GraphicsList>
+        <GraphicItem ID="1" GraphicFile="GSDML-LEPG-T-PIC" />
+      </GraphicsList>
+            <CategoryList>
+                <CategoryItem ID="V1.0" TextId="V1.0"/>
+            </CategoryList>      
+      <ExternalTextList>
+        <PrimaryLanguage>
+          <!--Product identification-->
+          <Text TextId="Output" Value="Output" />
+          <Text TextId="Input" Value="Input" />
+          <Text TextId="PN-UART X2" Value="LEPG-T" />
+          <Text TextId="Modue_Name_1" Value="PN-UART Name1" />          
+          <Text TextId="ProfiNet IO module" Value="ProfiNet IO module" />
+          <Text TextId="InfoText" Value="InfoText" />
+          <!--Modules categories-->
+          <Text TextId="V1.0" Value="V1.0" />
+          <!--Modules-->
+          <Text TextId="Output_Text" Value="Outputs" />
+          <Text TextId="Input_Text" Value="Inputs" />
+
+          <Text TextId="Output Module." Value="Output Module." />
+          <Text TextId="Input Module." Value="Input Module." />
+          <!--Submodules-->
+          <Text TextId="IDT_SS_Interface" Value="X1" />
+          <Text TextId="IDT_SS_Port1" Value="X1 P1" />
+          <Text TextId="IDT_SS_Port2" Value="X1 P2" />
+          <Text TextId="IDT_Port1" Value="Port 1" />
+          <Text TextId="IDT_Port2" Value="Port 2" />
+                    
+        </PrimaryLanguage>
+      </ExternalTextList>
+    </ApplicationProcess>
+  </ProfileBody>
+</ISO15745Profile>

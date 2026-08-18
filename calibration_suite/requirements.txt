@@ -1,0 +1,5 @@
+numpy>=1.24,<2.0
+opencv-python>=4.8,<5.0
+# Gemini 2 XL uses the locally built Orbbec SDK v1 Python extension.
+requests>=2.31
+zxing-cpp>=2.2

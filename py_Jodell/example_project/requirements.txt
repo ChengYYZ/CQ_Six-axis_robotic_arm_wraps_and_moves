@@ -1,0 +1,3 @@
+pyserial
+modbus-tk
+../python版本/JodellTool-0.0.1-py3-none-any.whl
