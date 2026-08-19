@@ -1,5 +1,6 @@
 # CQ_Six-axis_robotic_arm_wraps_and_moves
 六轴机械臂移动
+calibration_suite\project0714_grasp\waybill_inspection.py      条形码的识别程序
 ########################################
 2026.8.18
 ########################################
