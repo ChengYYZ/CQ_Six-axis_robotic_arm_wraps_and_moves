@@ -1,3 +1,4 @@
+# 条形码识别部分
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -9,7 +10,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 import json
 import time
-
+from collections.abc import Iterator
 import cv2
 import numpy as np
 import requests
@@ -25,6 +26,7 @@ class WaybillInspectionResult:
     waybill_frame_count: int
     elapsed_s: float
     error: str | None = None
+    detection_to_barcode_s: float | None = None
 
 
 class AsyncWaybillInspector:
@@ -64,7 +66,9 @@ class AsyncWaybillInspector:
         self.confidence = float(confidence)
         self.capture_count = max(1, int(capture_count))
         self.capture_interval_s = max(0.02, float(capture_interval_s))
-        self.capture_duration_s = max(self.capture_interval_s, float(capture_duration_s))
+        self.capture_duration_s = max(
+            self.capture_interval_s, float(capture_duration_s)
+        )
         self.c_settle_s = max(0.0, float(c_settle_s))
         self.post_c_capture_s = max(0.0, float(post_c_capture_s))
         self.request_timeout_s = max(0.1, float(request_timeout_s))
@@ -73,7 +77,9 @@ class AsyncWaybillInspector:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._zxingcpp = zxingcpp
         self._model = YOLO(str(model_path))
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="waybill-decode")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="waybill-decode"
+        )
         self._result_callback = result_callback or self._print_result
 
         self._lock = Lock()
@@ -143,11 +149,21 @@ class AsyncWaybillInspector:
         started = time.monotonic()
         capture_failures = 0
         camera_prewarmed = False
-        while not stop_event.is_set() and time.monotonic() - started < self.capture_duration_s:
+        while (
+            not stop_event.is_set()
+            and time.monotonic() - started < self.capture_duration_s
+        ):
             with self._lock:
-                c_arrival_time = self._c_arrival_time if generation == self._capture_generation else None
+                c_arrival_time = (
+                    self._c_arrival_time
+                    if generation == self._capture_generation
+                    else None
+                )
             now = time.monotonic()
-            if c_arrival_time is not None and now - c_arrival_time >= self.c_settle_s + self.post_c_capture_s:
+            if (
+                c_arrival_time is not None
+                and now - c_arrival_time >= self.c_settle_s + self.post_c_capture_s
+            ):
                 break
 
             # Start at B only to initialize the HTTP session/camera path. Do
@@ -172,7 +188,10 @@ class AsyncWaybillInspector:
                 continue
             camera_prewarmed = True
             with self._lock:
-                if generation != self._capture_generation or self._active_candidate is None:
+                if (
+                    generation != self._capture_generation
+                    or self._active_candidate is None
+                ):
                     return
                 # Frames acquired before C or during the post-arrival settling
                 # window keep the camera warm but are deliberately discarded.
@@ -189,7 +208,10 @@ class AsyncWaybillInspector:
 
         if not stop_event.is_set():
             with self._lock:
-                if generation != self._capture_generation or self._active_candidate is None:
+                if (
+                    generation != self._capture_generation
+                    or self._active_candidate is None
+                ):
                     return
                 candidate_index = self._active_candidate
                 self._active_candidate = None
@@ -201,12 +223,16 @@ class AsyncWaybillInspector:
     def _submit_frames(
         self, candidate_index: int, frames: list[np.ndarray]
     ) -> Future[WaybillInspectionResult]:
-        future = self._executor.submit(self._inspect_frames, int(candidate_index), frames)
+        future = self._executor.submit(
+            self._inspect_frames, int(candidate_index), frames
+        )
         self._futures[int(candidate_index)] = future
         future.add_done_callback(self._handle_future)
         return future
 
-    def _capture_snapshot(self, session: requests.Session, auth: HTTPDigestAuth) -> np.ndarray:
+    def _capture_snapshot(
+        self, session: requests.Session, auth: HTTPDigestAuth
+    ) -> np.ndarray:
         last_error: Exception | None = None
         for channel in ("101", "1"):
             url = f"http://{self.camera_ip}/ISAPI/Streaming/channels/{channel}/picture"
@@ -229,7 +255,9 @@ class AsyncWaybillInspector:
             raise RuntimeError("Hikvision JPEG decode failed.")
         return image
 
-    def _inspect_frames(self, candidate_index: int, frames: list[np.ndarray]) -> WaybillInspectionResult:
+    def _inspect_frames(
+        self, candidate_index: int, frames: list[np.ndarray]
+    ) -> WaybillInspectionResult:
         started = time.monotonic()
         if not frames:
             return WaybillInspectionResult(
@@ -242,7 +270,10 @@ class AsyncWaybillInspector:
                 error="No buffered frame was available at waypoint C.",
             )
 
-        run_dir = self.output_dir / f"candidate_{candidate_index}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        run_dir = (
+            self.output_dir
+            / f"candidate_{candidate_index}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        )
         run_dir.mkdir(parents=True, exist_ok=True)
         self._save_video(run_dir / "c_camera_capture.mp4", frames)
         full_frame_sharpness: list[float] = []
@@ -256,8 +287,10 @@ class AsyncWaybillInspector:
             f"full_frame_min={min(full_frame_sharpness):.2f}; "
             "full-frame sharpness is diagnostic only"
         )
-        decoded_votes: Counter[str] = Counter()
+        frame_votes: Counter[str] = Counter()
+        fusion_votes: Counter[str] = Counter()
         waybill_frame_count = 0
+        first_waybill_detected_at: float | None = None
 
         try:
             detected_rois: list[tuple[float, int, int, np.ndarray]] = []
@@ -266,18 +299,51 @@ class AsyncWaybillInspector:
                 boxes = self._detect_waybills(frame)
                 if not boxes:
                     continue
+                if first_waybill_detected_at is None:
+                    first_waybill_detected_at = time.monotonic()
                 waybill_frame_count += 1
                 for box_index, box in enumerate(boxes):
                     roi = self._crop(frame, box)
                     if roi.size == 0:
                         continue
-                    cv2.imwrite(str(run_dir / f"waybill_{frame_index}_{box_index}.jpg"), roi)
+                    cv2.imwrite(
+                        str(run_dir / f"waybill_{frame_index}_{box_index}.jpg"), roi
+                    )
                     roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                     roi_sharpness = float(cv2.Laplacian(roi_gray, cv2.CV_64F).var())
                     detected_rois.append((roi_sharpness, frame_index, box_index, roi))
 
-            detected_rois.sort(key=lambda item: item[0], reverse=True)
-            selected_rois = detected_rois[: min(6, len(detected_rois))]
+            # 每个物理帧只保留最清晰的一个 ROI，
+            # 避免同一帧因为多个检测框重复投票。
+            best_roi_by_frame_for_decode: dict[int, tuple[float, int, np.ndarray]] = {}
+
+            for sharpness, frame_index, box_index, roi in detected_rois:
+                previous = best_roi_by_frame_for_decode.get(frame_index)
+
+                if previous is None or sharpness > previous[0]:
+                    best_roi_by_frame_for_decode[frame_index] = (
+                        sharpness,
+                        box_index,
+                        roi,
+                    )
+
+            selected_rois = sorted(
+                [
+                    (
+                        sharpness,
+                        frame_index,
+                        box_index,
+                        roi,
+                    )
+                    for frame_index, (
+                        sharpness,
+                        box_index,
+                        roi,
+                    ) in best_roi_by_frame_for_decode.items()
+                ],
+                key=lambda item: item[0],
+                reverse=True,
+            )[:6]
             if selected_rois:
                 print(
                     f"Waybill ROI quality candidate #{candidate_index}: "
@@ -291,11 +357,19 @@ class AsyncWaybillInspector:
             # blurry frame from overwhelming agreement across real frames.
             for _sharpness, frame_index, box_index, roi in selected_rois:
                 codes = self._read_barcodes(roi)
-                decoded_votes.update(codes)
+
+                # 同一个物理帧对同一个值最多贡献一票
+                frame_votes.update(set(codes))
+
                 if codes:
                     print(
-                        f"Barcode candidates frame={frame_index} roi={box_index}: {codes}"
+                        f"Barcode candidates frame={frame_index} "
+                        f"roi={box_index}: {codes}"
                     )
+            # if codes:
+            #     print(
+            #         f"Barcode candidates frame={frame_index} roi={box_index}: {codes}"
+            #     )
 
             # At C the package is stationary. Align the best ROI from each
             # frame before fusing it; travel/settling frames have already been
@@ -309,22 +383,172 @@ class AsyncWaybillInspector:
             temporal_rois = [
                 item[1]
                 for _frame_index, item in sorted(
-                    best_roi_by_frame.items(), key=lambda entry: entry[1][0], reverse=True
+                    best_roi_by_frame.items(),
+                    key=lambda entry: entry[1][0],
+                    reverse=True,
                 )[:8]
             ]
             fused_rois = self._align_and_fuse_rois(temporal_rois)
             for fusion_name, fused_roi in fused_rois:
-                cv2.imwrite(str(run_dir / f"waybill_fused_{fusion_name}.png"), fused_roi)
+                cv2.imwrite(
+                    str(run_dir / f"waybill_fused_{fusion_name}.png"), fused_roi
+                )
                 codes = self._read_barcodes(fused_roi)
-                decoded_votes.update(codes)
+                fusion_votes.update(set(codes))
+
                 if codes:
                     print(f"Barcode candidates fusion={fusion_name}: {codes}")
+            barcode: str | None = None
+            frame_ranked = frame_votes.most_common()
+            fusion_ranked = fusion_votes.most_common()
 
-            barcode = decoded_votes.most_common(1)[0][0] if decoded_votes else None
-            if decoded_votes:
+            print(
+                f"Barcode raw votes candidate #{candidate_index}: "
+                f"frames={dict(frame_ranked)}, "
+                f"fusion={dict(fusion_ranked)}"
+            )
+
+            # --------------------------------------------------
+            # 情况 1：
+            # 至少两个真实物理帧识别出同一个条码
+            # --------------------------------------------------
+            if frame_ranked and frame_ranked[0][1] >= 2:
+
+                top_code = frame_ranked[0][0]
+                top_votes = frame_ranked[0][1]
+
+                second_votes = frame_ranked[1][1] if len(frame_ranked) > 1 else 0
+
+                if top_votes > second_votes:
+
+                    barcode = top_code
+
+                    print(
+                        f"Barcode accepted from physical-frame majority: "
+                        f"value={barcode}, "
+                        f"votes={top_votes}"
+                    )
+
+                else:
+                    print(f"Barcode physical-frame vote tied: " f"{dict(frame_ranked)}")
+
+            # --------------------------------------------------
+            # 情况 2：
+            # 没有明确的物理帧多数结果。
+            #
+            # 查找“真实帧 + 融合图”共同支持的结果，
+            # 而不是只检查 frame_ranked[0]。
+            # --------------------------------------------------
+
+            if barcode is None and frame_votes and fusion_votes:
+
+                agreement_codes = [
+                    code for code in frame_votes if fusion_votes.get(code, 0) > 0
+                ]
+
+                if agreement_codes:
+
+                    agreement_codes.sort(
+                        key=lambda code: (
+                            frame_votes[code] + fusion_votes[code],
+                            frame_votes[code],
+                            fusion_votes[code],
+                        ),
+                        reverse=True,
+                    )
+
+                    best_code = agreement_codes[0]
+
+                    best_score = frame_votes[best_code] + fusion_votes[best_code]
+
+                    tied_codes = [
+                        code
+                        for code in agreement_codes
+                        if (frame_votes[code] + fusion_votes[code]) == best_score
+                    ]
+
+                    if len(tied_codes) == 1:
+
+                        barcode = best_code
+
+                        print(
+                            f"Barcode accepted by frame+fusion agreement: "
+                            f"value={barcode}, "
+                            f"frame_votes={frame_votes[barcode]}, "
+                            f"fusion_votes={fusion_votes[barcode]}"
+                        )
+
+                    else:
+
+                        print(f"Barcode frame+fusion agreement tied: " f"{tied_codes}")
+
+            # --------------------------------------------------
+            # 情况 3：
+            # 真实帧完全没有成功结果。
+            #
+            # 至少两个独立融合方式得到相同结果才接受。
+            # --------------------------------------------------
+
+            if (
+                barcode is None
+                and not frame_votes
+                and fusion_ranked
+                and fusion_ranked[0][1] >= 2
+            ):
+                top_code = fusion_ranked[0][0]
+                top_votes = fusion_ranked[0][1]
+
+                second_votes = fusion_ranked[1][1] if len(fusion_ranked) > 1 else 0
+
+                if top_votes > second_votes:
+
+                    barcode = top_code
+
+                    print(
+                        f"Barcode accepted from fusion consensus: "
+                        f"value={barcode}, "
+                        f"votes={top_votes}"
+                    )
+
+            # --------------------------------------------------
+            # 情况 4：
+            # 证据不足或结果冲突
+            # --------------------------------------------------
+
+            if barcode is None:
+
                 print(
-                    f"Barcode vote candidate #{candidate_index}: "
-                    f"{dict(decoded_votes.most_common())}; selected={barcode}"
+                    f"Barcode unresolved candidate #{candidate_index}: "
+                    "no reliable agreement was found."
+                )
+            # barcode = decoded_votes.most_common(1)[0][0] if decoded_votes else None
+            # if frame_votes:
+            #     barcode = frame_votes.most_common(1)[0][0]
+            #     print(
+            #         f"Barcode vote candidate #{candidate_index}: "
+            #         f"{dict(frame_votes.most_common())}; "
+            #         f"selected={barcode}"
+            #     )
+            # elif fusion_votes:
+            #     barcode = fusion_votes.most_common(1)[0][0]
+
+            #     print(
+            #         f"Barcode fusion fallback candidate #{candidate_index}: "
+            #         f"{dict(fusion_votes.most_common())}; "
+            #         f"selected={barcode}"
+            #     )
+
+            # else:
+            #     barcode = None
+            detection_to_barcode_s = (
+                time.monotonic() - first_waybill_detected_at
+                if barcode is not None and first_waybill_detected_at is not None
+                else None
+            )
+            if detection_to_barcode_s is not None:
+                print(
+                    f"Waybill detection-to-barcode candidate #{candidate_index}: "
+                    f"{detection_to_barcode_s:.3f}s"
                 )
             has_waybill = waybill_frame_count >= 2 or barcode is not None
             if waybill_frame_count == 0 and len(frames) < 6:
@@ -357,6 +581,7 @@ class AsyncWaybillInspector:
                 frame_count=len(frames),
                 waybill_frame_count=waybill_frame_count,
                 elapsed_s=time.monotonic() - started,
+                detection_to_barcode_s=detection_to_barcode_s,
             )
         except Exception as exc:
             return WaybillInspectionResult(
@@ -447,7 +672,9 @@ class AsyncWaybillInspector:
             aspect = width / float(max(1, height))
             if not 0.70 <= aspect / ref_aspect <= 1.30:
                 continue
-            resized = cv2.resize(candidate, (ref_width, ref_height), interpolation=cv2.INTER_CUBIC)
+            resized = cv2.resize(
+                candidate, (ref_width, ref_height), interpolation=cv2.INTER_CUBIC
+            )
             moving = ecc_view(resized)
             warp_small = np.eye(2, 3, dtype=np.float32)
             try:
@@ -477,7 +704,9 @@ class AsyncWaybillInspector:
             alignment_scores.append(float(correlation))
 
         if len(aligned) < 2:
-            print("Waybill temporal fusion skipped: fewer than 2 ROIs aligned reliably.")
+            print(
+                "Waybill temporal fusion skipped: fewer than 2 ROIs aligned reliably."
+            )
             return []
 
         image_stack = np.stack(aligned).astype(np.float32)
@@ -523,19 +752,120 @@ class AsyncWaybillInspector:
         return [("weighted", weighted), ("median", median), ("focus", focus)]
 
     @staticmethod
-    def _enhance_images(image: np.ndarray) -> list[np.ndarray]:
+    def _enhance_images(image: np.ndarray) -> Iterator[np.ndarray]:
         gray = (
             cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             if image.ndim == 3
             else image.astype(np.uint8, copy=False)
         )
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-        strong_clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(6, 6)).apply(gray)
-        denoised = cv2.bilateralFilter(gray, 5, 30, 30)
-        blur = cv2.GaussianBlur(clahe, (0, 0), 1.0)
-        sharp = cv2.addWeighted(clahe, 1.9, blur, -0.9, 0)
-        _, binary = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        adaptive_light = cv2.adaptiveThreshold(
+        # 1. 原图
+        yield image
+
+        # 2. 灰度图
+        yield gray
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8),
+        ).apply(gray)
+
+        yield clahe
+        # 4. 锐化
+        blur = cv2.GaussianBlur(
+            clahe,
+            (0, 0),
+            1.0,
+        )
+
+        sharp = cv2.addWeighted(
+            clahe,
+            1.9,
+            blur,
+            -0.9,
+            0,
+        )
+
+        yield sharp
+        # --------------------------------------------------
+
+        # 根据 ROI 尺寸动态决定是否放大
+        # --------------------------------------------------
+
+        height, width = gray.shape[:2]
+        max_side = max(height, width)
+
+        # 很小的条码 ROI
+        if max_side < 450:
+
+            clahe_3x = cv2.resize(
+                clahe,
+                None,
+                fx=3.0,
+                fy=3.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            yield clahe_3x
+
+            sharp_3x = cv2.resize(
+                sharp,
+                None,
+                fx=3.0,
+                fy=3.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            yield sharp_3x
+
+        # 中等大小条码 ROI
+        elif max_side < 700:
+
+            clahe_2x = cv2.resize(
+                clahe,
+                None,
+                fx=2.0,
+                fy=2.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            yield clahe_2x
+
+            sharp_2x = cv2.resize(
+                sharp,
+                None,
+                fx=2.0,
+                fy=2.0,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            yield sharp_2x
+
+        # --------------------------------------------------
+        # 前面的常规方案全部失败以后
+        # 再尝试去噪、二值化等更强处理
+        # --------------------------------------------------
+
+        # 5. 双边滤波
+        denoised = cv2.bilateralFilter(
+            gray,
+            5,
+            30,
+            30,
+        )
+
+        yield denoised
+
+        # 6. Otsu 二值化
+        _, binary = cv2.threshold(
+            sharp,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+
+        yield binary
+
+        # 7. 自适应二值化
+        adaptive = cv2.adaptiveThreshold(
             clahe,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -543,47 +873,42 @@ class AsyncWaybillInspector:
             31,
             5,
         )
-        adaptive_dark = cv2.adaptiveThreshold(
-            strong_clahe,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            41,
-            11,
-        )
-        # Sauvola-style local threshold tolerates the uneven illumination in
-        # the C-camera image without inventing new bar edges.
+
+        yield adaptive
+
+        # 8. Sauvola 风格局部阈值
         normalized = gray.astype(np.float32) / 255.0
-        local_mean = cv2.boxFilter(normalized, cv2.CV_32F, (31, 31), normalize=True)
+
+        local_mean = cv2.boxFilter(
+            normalized,
+            cv2.CV_32F,
+            (31, 31),
+            normalize=True,
+        )
+
         local_square = cv2.boxFilter(
-            normalized * normalized, cv2.CV_32F, (31, 31), normalize=True
+            normalized * normalized,
+            cv2.CV_32F,
+            (31, 31),
+            normalize=True,
         )
-        local_std = np.sqrt(np.maximum(local_square - local_mean * local_mean, 0.0))
+
+        local_std = np.sqrt(
+            np.maximum(
+                local_square - local_mean * local_mean,
+                0.0,
+            )
+        )
+
         sauvola_threshold = local_mean * (1.0 + 0.22 * (local_std / 0.5 - 1.0))
-        sauvola = np.where(normalized > sauvola_threshold, 255, 0).astype(np.uint8)
-        vertical_repair = cv2.morphologyEx(
-            adaptive_dark,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
-        )
-        return [
-            image,
-            gray,
-            denoised,
-            clahe,
-            strong_clahe,
-            sharp,
-            binary,
-            adaptive_light,
-            adaptive_dark,
-            sauvola,
-            vertical_repair,
-            cv2.resize(clahe, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC),
-            cv2.resize(adaptive_light, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST),
-            cv2.resize(sharp, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC),
-            cv2.resize(sharp, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC),
-            cv2.resize(sauvola, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST),
-        ]
+
+        sauvola = np.where(
+            normalized > sauvola_threshold,
+            255,
+            0,
+        ).astype(np.uint8)
+
+        yield sauvola
 
     @staticmethod
     def _order_quad(points: np.ndarray) -> np.ndarray:
@@ -591,8 +916,8 @@ class AsyncWaybillInspector:
         ordered = np.zeros((4, 2), dtype=np.float32)
         sums = points.sum(axis=1)
         differences = np.diff(points, axis=1).ravel()
-        ordered[0] = points[np.argmin(sums)]       # top-left
-        ordered[2] = points[np.argmax(sums)]       # bottom-right
+        ordered[0] = points[np.argmin(sums)]  # top-left
+        ordered[2] = points[np.argmax(sums)]  # bottom-right
         ordered[1] = points[np.argmin(differences)]  # top-right
         ordered[3] = points[np.argmax(differences)]  # bottom-left
         return ordered
@@ -619,7 +944,9 @@ class AsyncWaybillInspector:
             dtype=np.float32,
         )
         matrix = cv2.getPerspectiveTransform(
-            np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32),
+            np.array(
+                [top_left, top_right, bottom_right, bottom_left], dtype=np.float32
+            ),
             destination,
         )
         return cv2.warpPerspective(
@@ -634,7 +961,9 @@ class AsyncWaybillInspector:
         edges = cv2.morphologyEx(
             edges, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         )
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         image_area = float(image.shape[0] * image.shape[1])
         for contour in sorted(contours, key=cv2.contourArea, reverse=True):
             if cv2.contourArea(contour) < image_area * 0.30:
@@ -678,7 +1007,9 @@ class AsyncWaybillInspector:
                 crop = cls._four_point_transform(image, points_item)
                 if crop.shape[0] > crop.shape[1]:
                     crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
-                regions.append((float(crop.shape[0] * crop.shape[1]), cls._add_quiet_zone(crop)))
+                regions.append(
+                    (float(crop.shape[0] * crop.shape[1]), cls._add_quiet_zone(crop))
+                )
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         scale = max(1.0, min(image.shape[:2]) / 500.0)
@@ -702,7 +1033,9 @@ class AsyncWaybillInspector:
         for contour in contours:
             rectangle = cv2.minAreaRect(contour)
             rect_width, rect_height = rectangle[1]
-            long_side, short_side = max(rect_width, rect_height), min(rect_width, rect_height)
+            long_side, short_side = max(rect_width, rect_height), min(
+                rect_width, rect_height
+            )
             area = rect_width * rect_height
             if short_side < 10 or long_side / max(short_side, 1.0) < 1.8:
                 continue
@@ -723,60 +1056,198 @@ class AsyncWaybillInspector:
     @staticmethod
     def _normalize_barcode_text(value: object) -> str | None:
         text = str(value or "").strip()
-        if len(text) < 4 or "\ufffd" in text:
+        if len(text) < 13 or "\ufffd" in text:
             return None
         return text
 
-    def _read_barcodes(self, image: np.ndarray) -> list[str]:
-        """Return checksum-valid decoder candidates from one physical/fused image."""
-        rectified = self._rectify_waybill(image)
-        # This detector only handles one-dimensional barcodes. It is a useful
-        # independent fallback for low-resolution labels where ZXing can find
-        # neither a valid start/stop pattern nor a checksum.
-        try:
-            decoded, _points, _straight = cv2.barcode_BarcodeDetector().detectAndDecode(
-                rectified
-            )
-            if isinstance(decoded, str):
-                text = self._normalize_barcode_text(decoded)
-                if text:
-                    return [text]
-            if isinstance(decoded, (tuple, list)):
-                codes = {
-                    normalized
-                    for value in decoded
-                    if (normalized := self._normalize_barcode_text(value)) is not None
-                }
-                if codes:
-                    return sorted(codes)
-        except (AttributeError, cv2.error):
-            pass
+    # def _read_barcodes(self, image: np.ndarray) -> list[str]:
+    #     rectified = self._rectify_waybill(image)
 
-        # Search focused barcode crops first. Keep the complete ROI as a fallback
-        # because a clean, large barcode is often decoded without segmentation.
+    #     # --------------------------------------------------
+    #     # 第一阶段：
+    #     # OpenCV BarcodeDetector 快速尝试
+    #     # --------------------------------------------------
+
+    #     try:
+    #         decoded, _points, _straight = cv2.barcode_BarcodeDetector().detectAndDecode(
+    #             rectified
+    #         )
+
+    #         if isinstance(decoded, str):
+    #             text = self._normalize_barcode_text(decoded)
+
+    #             if text:
+    #                 return [text]
+
+    #         if isinstance(decoded, (tuple, list)):
+    #             codes = {
+    #                 normalized
+    #                 for value in decoded
+    #                 if (normalized := self._normalize_barcode_text(value)) is not None
+    #             }
+
+    #             if codes:
+    #                 return sorted(codes)
+
+    #     except (AttributeError, cv2.error):
+    #         pass
+
+    #     # --------------------------------------------------
+    #     # 第二阶段：
+    #     # 定位面单中的一维条码区域
+    #     # --------------------------------------------------
+
+    #     regions = self._find_linear_barcode_regions(rectified)
+
+    #     # --------------------------------------------------
+    #     # 如果定位算法没有找到或定位不准确，
+    #     # 完整面单 ROI 继续作为兜底
+    #     # --------------------------------------------------
+
+    #     regions.extend(
+    #         [
+    #             self._add_quiet_zone(rectified),
+    #             self._add_quiet_zone(
+    #                 cv2.rotate(
+    #                     rectified,
+    #                     cv2.ROTATE_90_CLOCKWISE,
+    #                 )
+    #             ),
+    #         ]
+    #     )
+
+    #     formats = self._zxingcpp.BarcodeFormat.AllLinear
+
+    #     # --------------------------------------------------
+    #     # 第三阶段：
+    #     # 每个条码区域按逐级增强方式尝试
+    #     # --------------------------------------------------
+    #     for region_index, region in enumerate(regions):
+    #         for enhance_index, candidate in enumerate(self._enhance_images(region)):
+    #             codes: set[str] = set()
+    #             try:
+    #                 results = self._zxingcpp.read_barcodes(
+    #                     candidate,
+    #                     formats=formats,
+    #                     try_rotate=True,
+    #                     try_downscale=False,
+    #                     try_invert=True,
+    #                 )
+
+    #             except Exception as exc:
+    #                 print(
+    #                     f"ZXingCPP decode failed "
+    #                     f"region={region_index} "
+    #                     f"enhance={enhance_index}: {exc}"
+    #                 )
+    #                 continue
+
+    #             for result in results:
+
+    #                 text = self._normalize_barcode_text(result.text)
+
+    #                 if text:
+    #                     codes.add(text)
+
+    #             # 一旦当前增强版本成功，
+    #             # 立即停止后续增强和放大
+    #             if codes:
+
+    #                 print(
+    #                     f"Barcode decoded: "
+    #                     f"region={region_index} "
+    #                     f"enhance={enhance_index} "
+    #                     f"value={sorted(codes)}"
+    #                 )
+    #                 return sorted(codes)
+
+    #     return []
+    def _read_barcodes(self, image: np.ndarray) -> list[str]:
+        rectified = self._rectify_waybill(image)
+
+        # --------------------------------------------------
+        # 第一阶段：
+        # 定位可能的一维条码区域
+        #
+        # _find_linear_barcode_regions() 内部仍然可以使用
+        # OpenCV BarcodeDetector.detect()，但只用于定位，
+        # 不使用 OpenCV 进行最终解码。
+        # --------------------------------------------------
+
         regions = self._find_linear_barcode_regions(rectified)
+
+        # --------------------------------------------------
+        # 第二阶段：
+        # 如果条码定位失败或定位不准确，
+        # 完整面单 ROI 作为兜底。
+        #
+        # 同时加入旋转 90° 的版本。
+        # --------------------------------------------------
+
         regions.extend(
             [
                 self._add_quiet_zone(rectified),
-                self._add_quiet_zone(cv2.rotate(rectified, cv2.ROTATE_90_CLOCKWISE)),
+                self._add_quiet_zone(
+                    cv2.rotate(
+                        rectified,
+                        cv2.ROTATE_90_CLOCKWISE,
+                    )
+                ),
             ]
         )
-        formats = self._zxingcpp.BarcodeFormat.AllLinear
-        for region in regions:
-            for candidate in self._enhance_images(region):
+
+        # 当前业务读取一维条形码
+        formats = self._zxingcpp.BarcodeFormat.Code128
+
+        # --------------------------------------------------
+        # 第三阶段：
+        # ZXingCPP 逐区域、逐增强版本尝试。
+        #
+        # _enhance_images() 是 yield 生成器，
+        # 一旦识别成功，后面的增强不会继续计算。
+        # --------------------------------------------------
+
+        for region_index, region in enumerate(regions):
+
+            for enhance_index, candidate in enumerate(self._enhance_images(region)):
+
+                try:
+                    results = self._zxingcpp.read_barcodes(
+                        candidate,
+                        formats=formats,
+                        try_rotate=True,
+                        try_downscale=False,
+                        try_invert=True,
+                    )
+
+                except Exception as exc:
+                    print(
+                        f"ZXingCPP decode failed "
+                        f"region={region_index} "
+                        f"enhance={enhance_index}: {exc}"
+                    )
+                    continue
+
                 codes: set[str] = set()
-                for result in self._zxingcpp.read_barcodes(
-                    candidate,
-                    formats=formats,
-                    try_rotate=True,
-                    try_downscale=False,
-                    try_invert=True,
-                ):
+
+                for result in results:
                     text = self._normalize_barcode_text(result.text)
+
                     if text:
                         codes.add(text)
+
                 if codes:
-                    return sorted(codes)
+                    decoded = sorted(codes)
+
+                    print(
+                        f"Barcode decoded by ZXingCPP: "
+                        f"region={region_index} "
+                        f"enhance={enhance_index} "
+                        f"value={decoded}"
+                    )
+
+                    return decoded
+
         return []
 
     def _read_barcode(self, image: np.ndarray) -> str | None:
@@ -802,6 +1273,11 @@ class AsyncWaybillInspector:
             "frame_count": result.frame_count,
             "waybill_frame_count": result.waybill_frame_count,
             "elapsed_s": round(result.elapsed_s, 3),
+            "detection_to_barcode_s": (
+                round(result.detection_to_barcode_s, 3)
+                if result.detection_to_barcode_s is not None
+                else None
+            ),
             "error": result.error,
         }
         with (self.output_dir / "results.jsonl").open("a", encoding="utf-8") as stream:
@@ -813,11 +1289,19 @@ class AsyncWaybillInspector:
         if result.error:
             print(f"{prefix}: ERROR {result.error}")
         elif not result.has_waybill:
-            print(f"{prefix}: no waybill ({result.frame_count} frame(s), {result.elapsed_s:.2f}s).")
+            print(
+                f"{prefix}: no waybill ({result.frame_count} frame(s), {result.elapsed_s:.2f}s)."
+            )
         elif result.barcode:
+            detection_to_barcode = (
+                f", detection-to-barcode={result.detection_to_barcode_s:.3f}s"
+                if result.detection_to_barcode_s is not None
+                else ""
+            )
             print(
                 f"{prefix}: waybill detected, barcode={result.barcode} "
-                f"({result.waybill_frame_count}/{result.frame_count} frame(s), {result.elapsed_s:.2f}s)."
+                f"({result.waybill_frame_count}/{result.frame_count} frame(s), "
+                f"total={result.elapsed_s:.2f}s{detection_to_barcode})."
             )
         else:
             print(

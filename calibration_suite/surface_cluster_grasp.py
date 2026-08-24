@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
@@ -40,6 +41,59 @@ from project0714_grasp.waybill_inspection import AsyncWaybillInspector
 COLOR_WINDOW = "Project0714 Surface Grasp Color"
 DEPTH_WINDOW = "Project0714 Surface Grasp Depth"
 POINT_CLOUD_WINDOW = "Project0714 Candidate Point Cloud"
+
+
+class GlobalSpaceStopMonitor:
+    """Watch the Windows SPACE key independently of OpenCV window focus."""
+
+    VK_SPACE = 0x20
+
+    def __init__(self, on_space_pressed: Callable[[], None], poll_interval_s: float = 0.02):
+        self._on_space_pressed = on_space_pressed
+        self._poll_interval_s = poll_interval_s
+        self._shutdown = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._get_async_key_state = None
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+
+            self._get_async_key_state = ctypes.windll.user32.GetAsyncKeyState
+        except Exception as exc:
+            print(f"Warning: global SPACE stop listener is unavailable: {exc}")
+            return False
+
+        self._shutdown.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="robot-space-stop-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._shutdown.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        was_pressed = False
+        while not self._shutdown.wait(self._poll_interval_s):
+            get_key_state = self._get_async_key_state
+            if get_key_state is None:
+                return
+            pressed = bool(get_key_state(self.VK_SPACE) & 0x8000)
+            if pressed and not was_pressed:
+                try:
+                    self._on_space_pressed()
+                except Exception as exc:
+                    print(f"Warning: SPACE stop callback failed: {exc}")
+            was_pressed = pressed
 
 @dataclass
 class PlaneModel:
@@ -114,6 +168,7 @@ class SuctionApproachPlan:
     rpy_mode: str
     score: float
     travel_mm: float
+    cup_to_package_mm: float
     radial_reach_mm: float
     unused_cup_clearance_mm: float
 
@@ -124,6 +179,12 @@ WAYPOINT_A_STAR = RobotWaypoint("A*", 110.628, -829.682, 482.697, -1.917, 2.748,
 WAYPOINT_B = RobotWaypoint("B", 779.155, -218.594, 487.419, -0.296, 1.428, -6.094)
 WAYPOINT_C = RobotWaypoint("C", 916.271, 119.481, 326.308, -1.990, 5.492, -3.082)
 WAYPOINT_D = RobotWaypoint("D", 452.368, 808.428, 284.504, -3.030, 0.839, 79.567)
+# This high point has been physically tested with a 90-degree local-Z turn.
+# Its taught orientation is the zero-angle reference for the same tool/package
+# relationship used at D. Rotation is completed here before descending to D.
+WAYPOINT_D_ROTATE_SAFE = RobotWaypoint(
+    "D-rotate-safe", 225.733, 550.238, 535.240, -2.080, 1.287, 83.579
+)
 FIXED_GRASP_X_YAW_DEG = -96.09
 
 
@@ -415,7 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--normal-mode",
         choices=("auto", "top-plane", "support-plane", "base-z"),
-        default="auto",
+        default="base-z",
         help="Normal used for grasp orientation and standoff",
     )
     parser.add_argument(
@@ -2230,6 +2291,14 @@ def target_rpy_for_candidate(
             raise RuntimeError("fixed RPY mode requires --fixed-pickup-rpy-deg")
         return np.asarray(args.fixed_pickup_rpy_deg, dtype=np.float64), "fixed"
     if args.align_normal_rpy or args.rpy_mode == "align-normal":
+        placement_candidates = placement_aligned_pickup_rpy_candidates(
+            candidate,
+            current_pose,
+            args,
+        )
+        if placement_candidates:
+            placement_mode, placement_rpy_deg = placement_candidates[0]
+            return placement_rpy_deg, placement_mode
         return (
             compute_grasp_rpy_from_normal_and_fixed_x(
                 candidate.normal_base,
@@ -2249,6 +2318,47 @@ def target_rpy_for_candidate(
     )
 
 
+def placement_aligned_pickup_rpy_candidates(
+    candidate: ClusterCandidate,
+    current_pose,
+    args: argparse.Namespace,
+) -> list[tuple[str, np.ndarray]]:
+    """Orient the empty tool so D needs no loaded package rotation."""
+    try:
+        long_axis_base = package_long_axis_base(candidate)
+    except Exception:
+        return []
+
+    package_long_yaw_deg = float(
+        np.degrees(np.arctan2(long_axis_base[1], long_axis_base[0]))
+    )
+    # Tool Y must be parallel to the package long edge at pickup. The two
+    # directions are equivalent because a rectangle long axis is undirected.
+    tool_x_yaws_deg = [package_long_yaw_deg - 90.0, package_long_yaw_deg + 90.0]
+    current_rotation = rpy_xyz_to_matrix(current_pose.rpy_rad_xyz)
+    candidates: list[tuple[float, str, np.ndarray]] = []
+    for tool_x_yaw_deg in tool_x_yaws_deg:
+        wrapped_yaw_deg = (tool_x_yaw_deg + 180.0) % 360.0 - 180.0
+        rpy_deg = compute_grasp_rpy_from_normal_and_fixed_x(
+            candidate.normal_base,
+            wrapped_yaw_deg,
+            args.tool_contact_axis,
+        )
+        distance_deg = rotation_distance_deg(
+            current_rotation,
+            rpy_xyz_to_matrix(np.radians(rpy_deg)),
+        )
+        candidates.append(
+            (
+                distance_deg,
+                f"align_normal_package_long_for_d_yaw_{wrapped_yaw_deg:+.1f}deg",
+                rpy_deg,
+            )
+        )
+    candidates.sort(key=lambda item: item[0])
+    return [(mode, rpy_deg) for _distance, mode, rpy_deg in candidates]
+
+
 def target_rpy_candidates_for_candidate(
     candidate: ClusterCandidate,
     current_pose,
@@ -2258,9 +2368,25 @@ def target_rpy_candidates_for_candidate(
 ) -> list[tuple[str, np.ndarray]]:
     if not (args.align_normal_rpy or args.rpy_mode == "align-normal"):
         return [(primary_rpy_mode, primary_rpy_deg)]
-    if primary_rpy_mode == "align_normal_fixed_x":
-        fixed_rpy_deg = np.asarray(primary_rpy_deg, dtype=np.float64)
-        candidates = [(primary_rpy_mode, fixed_rpy_deg)]
+    if primary_rpy_mode == "align_normal_fixed_x" or primary_rpy_mode.startswith(
+        "align_normal_package_long_for_d"
+    ):
+        candidates: list[tuple[str, np.ndarray]] = []
+        if primary_rpy_mode.startswith("align_normal_package_long_for_d"):
+            candidates.extend(
+                placement_aligned_pickup_rpy_candidates(candidate, current_pose, args)
+            )
+
+        fixed_rpy_deg = compute_grasp_rpy_from_normal_and_fixed_x(
+            candidate.normal_base,
+            FIXED_GRASP_X_YAW_DEG,
+            args.tool_contact_axis,
+        )
+        if not any(
+            np.allclose(existing_rpy, fixed_rpy_deg, atol=1e-6)
+            for _existing_mode, existing_rpy in candidates
+        ):
+            candidates.append(("align_normal_fixed_x", fixed_rpy_deg))
         if args.disable_fixed_x_yaw_fallback:
             return candidates
 
@@ -2268,17 +2394,25 @@ def target_rpy_candidates_for_candidate(
         max_deg = max(0.0, float(args.fixed_x_fallback_yaw_max_deg))
         offset_deg = step_deg
         while offset_deg <= max_deg + 1e-6:
-            fallback_rpy_deg = compute_grasp_rpy_from_normal_and_fixed_x(
-                candidate.normal_base,
-                FIXED_GRASP_X_YAW_DEG + offset_deg,
-                args.tool_contact_axis,
-            )
-            candidates.append(
-                (
-                    f"align_normal_fixed_x_fallback_yaw_{offset_deg:+.1f}deg",
-                    fallback_rpy_deg,
+            # Search both wrist-yaw directions. The previous positive-only
+            # search could test -66/-36/-6 deg from a -96 deg fixed heading
+            # while omitting the equally valid -126/-156/+174 deg branches.
+            for signed_offset_deg in (offset_deg, -offset_deg):
+                fallback_rpy_deg = compute_grasp_rpy_from_normal_and_fixed_x(
+                    candidate.normal_base,
+                    FIXED_GRASP_X_YAW_DEG + signed_offset_deg,
+                    args.tool_contact_axis,
                 )
-            )
+                if not any(
+                    np.allclose(existing_rpy, fallback_rpy_deg, atol=1e-6)
+                    for _existing_mode, existing_rpy in candidates
+                ):
+                    candidates.append(
+                        (
+                            f"align_normal_fixed_x_fallback_yaw_{signed_offset_deg:+.1f}deg",
+                            fallback_rpy_deg,
+                        )
+                    )
             offset_deg += step_deg
         return candidates
     no_flip_rpy_deg = compute_grasp_rpy_from_normal(
@@ -3840,15 +3974,28 @@ def move_waypoint(
     motion_options: MotionOptions,
     override_rpy_deg: np.ndarray | None = None,
 ) -> None:
-    rpy_deg = (
+    raw_rpy_deg = (
         np.asarray(override_rpy_deg, dtype=np.float64)
         if override_rpy_deg is not None
         else np.asarray([waypoint.rx_deg, waypoint.ry_deg, waypoint.rz_deg], dtype=np.float64)
     )
+    # Fixed taught Euler angles are commonly reported in the canonical
+    # [-180, 180] range.  Reusing those raw values after a failed suction
+    # plan can turn an equivalent +91 degree return into a -269 degree MoveJ
+    # command (for example +173.91 -> A* -94.661).  Make every fixed-waypoint
+    # command continuous from the robot's actual pose, in both directions.
+    current_rpy_deg = robot.read_current_pose().rpy_deg_xyz()
+    continuous_rpy_deg = unwrap_rpy_deg(raw_rpy_deg, current_rpy_deg)
+    require_safe_rpy_step(
+        current_rpy_deg,
+        continuous_rpy_deg,
+        label=f"current pose -> waypoint {waypoint.name}",
+    )
     print(
         f"Moving waypoint {waypoint.name}: "
         f"XYZ(mm)={[waypoint.x_mm, waypoint.y_mm, waypoint.z_mm]} "
-        f"RPY(deg)={rpy_deg.round(3).tolist()} "
+        f"raw RPY(deg)={raw_rpy_deg.round(3).tolist()} "
+        f"continuous RPY(deg)={continuous_rpy_deg.round(3).tolist()} "
         f"motion={motion_options.motion}"
     )
     move_pose_with_singularity_fallback(
@@ -3856,9 +4003,9 @@ def move_waypoint(
         waypoint.x_mm,
         waypoint.y_mm,
         waypoint.z_mm,
-        float(rpy_deg[0]),
-        float(rpy_deg[1]),
-        float(rpy_deg[2]),
+        float(continuous_rpy_deg[0]),
+        float(continuous_rpy_deg[1]),
+        float(continuous_rpy_deg[2]),
         motion_options,
         allow_clear_confdata_retry=not motion_options.use_current_conf_data,
         allow_movej_singularity_retry=not motion_options.use_current_conf_data,
@@ -3881,16 +4028,26 @@ def move_loaded_transfer_with_singularity_fallback(
     waypoint: RobotWaypoint,
     robot: XCoreRobotClient,
     motion_options: MotionOptions,
+    *,
+    allow_current_conf_movej_fallback: bool = True,
 ) -> None:
-    """Prefer Cartesian loaded travel, but use MoveJ for a proven singular path."""
-    rpy_deg = np.asarray(
+    """Prefer loaded MoveL; on path singularity use MoveJ in the same configuration."""
+    raw_rpy_deg = np.asarray(
         [waypoint.rx_deg, waypoint.ry_deg, waypoint.rz_deg],
         dtype=np.float64,
+    )
+    current_rpy_deg = robot.read_current_pose().rpy_deg_xyz()
+    continuous_rpy_deg = unwrap_rpy_deg(raw_rpy_deg, current_rpy_deg)
+    require_safe_rpy_step(
+        current_rpy_deg,
+        continuous_rpy_deg,
+        label=f"loaded current pose -> {waypoint.name}",
     )
     print(
         f"Moving loaded transfer {waypoint.name}: "
         f"XYZ(mm)={[round(waypoint.x_mm, 3), round(waypoint.y_mm, 3), round(waypoint.z_mm, 3)]} "
-        f"RPY(deg)={rpy_deg.round(3).tolist()} motion=movel"
+        f"raw RPY(deg)={raw_rpy_deg.round(3).tolist()} "
+        f"continuous RPY(deg)={continuous_rpy_deg.round(3).tolist()} motion=movel"
     )
     try:
         move_pose_with_singularity_fallback(
@@ -3898,37 +4055,47 @@ def move_loaded_transfer_with_singularity_fallback(
             waypoint.x_mm,
             waypoint.y_mm,
             waypoint.z_mm,
-            float(rpy_deg[0]),
-            float(rpy_deg[1]),
-            float(rpy_deg[2]),
+            float(continuous_rpy_deg[0]),
+            float(continuous_rpy_deg[1]),
+            float(continuous_rpy_deg[2]),
             replace(motion_options, motion="movel", zone_mm=0.0, use_current_conf_data=True),
-            allow_clear_confdata_retry=True,
-            allow_movej_singularity_retry=True,
+            # This wrapper owns the only permitted fallback: MoveJ with the
+            # current configuration. Never let the generic helper clear
+            # confData or choose a remote joint branch for a loaded package.
+            allow_clear_confdata_retry=False,
+            allow_movej_singularity_retry=False,
         )
     except Exception as exc:
-        # A current-conf MoveL can first report -50021; its internal no-conf
-        # retry may then expose the real path singularity. Handle that chained
-        # case here as well.
+        # A Cartesian path can cross a singularity even when the endpoint has
+        # a valid solution. Only that specific path error may switch to MoveJ,
+        # and the current configuration must remain locked.
         message = str(exc)
         if "50102" not in message and "奇异点" not in message:
             raise
+        if not allow_current_conf_movej_fallback:
+            raise RuntimeError(
+                f"Strict loaded rotation to {waypoint.name} was rejected; "
+                "MoveJ fallback is disabled for this rotation segment. "
+                f"Controller error: {exc}"
+            ) from exc
         print(
-            f"Loaded MoveL to {waypoint.name} still crosses a singularity after confData retry; "
-            "stopping it and using MoveJ without confData."
+            f"Loaded MoveL to {waypoint.name} crosses a Cartesian path singularity; "
+            "stopping that trajectory and retrying MoveJ with the current confData and "
+            "the same continuous orientation."
         )
         robot.stop_motion()
         robot.move_to_pose_mm_deg(
             waypoint.x_mm,
             waypoint.y_mm,
             waypoint.z_mm,
-            float(rpy_deg[0]),
-            float(rpy_deg[1]),
-            float(rpy_deg[2]),
+            float(continuous_rpy_deg[0]),
+            float(continuous_rpy_deg[1]),
+            float(continuous_rpy_deg[2]),
             options=replace(
                 motion_options,
                 motion="movej",
                 zone_mm=0.0,
-                use_current_conf_data=False,
+                use_current_conf_data=True,
             ),
         )
 
@@ -4012,18 +4179,10 @@ def move_empty_approach_to_a(
     approach_xyz_mm: np.ndarray,
     rpy_deg: np.ndarray,
     motion_options: MotionOptions,
-) -> None:
+) -> np.ndarray:
     # A* is a physically taught and verified empty/loaded transition point.
     # Use joint interpolation B -> A* -> dynamic A; reserve Cartesian MoveL
     # for the short vertical A -> pickup contact motion.
-    approach_pose = (
-        float(approach_xyz_mm[0]),
-        float(approach_xyz_mm[1]),
-        float(approach_xyz_mm[2]),
-        float(rpy_deg[0]),
-        float(rpy_deg[1]),
-        float(rpy_deg[2]),
-    )
     current_pose = robot.read_current_pose()
     a_star_xyz_mm = np.asarray(
         [WAYPOINT_A_STAR.x_mm, WAYPOINT_A_STAR.y_mm, WAYPOINT_A_STAR.z_mm],
@@ -4053,17 +4212,59 @@ def move_empty_approach_to_a(
             robot,
             replace(motion_options, motion="movej", zone_mm=0.0, use_current_conf_data=True),
         )
+
+    # The same Cartesian orientation may be written as +175.38 or -184.62
+    # degrees. Always command the representation nearest to the actual A*
+    # orientation; otherwise MoveJ can wind the wrist through +270 degrees.
+    a_star_pose = robot.read_current_pose()
+    continuous_rpy_deg = unwrap_rpy_deg(rpy_deg, a_star_pose.rpy_deg_xyz())
+    require_safe_rpy_step(
+        a_star_pose.rpy_deg_xyz(),
+        continuous_rpy_deg,
+        label="empty A* -> dynamic A",
+    )
+    approach_pose = (
+        float(approach_xyz_mm[0]),
+        float(approach_xyz_mm[1]),
+        float(approach_xyz_mm[2]),
+        float(continuous_rpy_deg[0]),
+        float(continuous_rpy_deg[1]),
+        float(continuous_rpy_deg[2]),
+    )
     print(
         "Moving from A* to dynamic A: "
         f"XYZ(mm)={np.asarray(approach_pose[:3]).round(2).tolist()} "
-        f"RPY(deg)={np.asarray(approach_pose[3:6]).round(2).tolist()} motion=movej"
+        f"raw RPY(deg)={np.asarray(rpy_deg).round(2).tolist()} "
+        f"continuous RPY(deg)={continuous_rpy_deg.round(2).tolist()} motion=movej"
     )
     move_pose_with_singularity_fallback(
         robot,
         *approach_pose,
         replace(motion_options, motion="movej", zone_mm=0.0, use_current_conf_data=True),
-        allow_clear_confdata_retry=True,
+        # If this Cartesian target has no solution in the current A* branch,
+        # try the next cup/yaw plan. Clearing confData here can select a remote
+        # joint solution and recreate the >180-degree wrist motion.
+        allow_clear_confdata_retry=False,
         allow_movej_singularity_retry=False,
+    )
+    return continuous_rpy_deg
+
+
+def is_robot_power_or_safety_state_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "ec': -17" in message
+        or 'ec": -17' in message
+        or "上下电状态" in message
+        or "power state" in message.lower()
+    )
+
+
+def is_operator_software_stop_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "operator software stop request" in message
+        or "batch interrupted by operator" in message
     )
 
 
@@ -4126,6 +4327,7 @@ def build_suction_approach_plans(
     candidate: ClusterCandidate,
     scene_candidates: list[ClusterCandidate],
     current_tcp_xyz_mm: np.ndarray,
+    current_tcp_rpy_deg: np.ndarray,
     physical_approach_xyz_mm: np.ndarray,
     physical_pickup_xyz_mm: np.ndarray,
     rpy_candidates: list[tuple[str, np.ndarray]],
@@ -4146,14 +4348,36 @@ def build_suction_approach_plans(
         [WAYPOINT_A_STAR.x_mm, WAYPOINT_A_STAR.y_mm, WAYPOINT_A_STAR.z_mm],
         dtype=np.float64,
     )
+    current_rotation = rpy_xyz_to_matrix(
+        np.radians(np.asarray(current_tcp_rpy_deg, dtype=np.float64))
+    )
 
     for rpy_mode, rpy_deg in rpy_candidates:
         rotation = rpy_xyz_to_matrix(np.radians(np.asarray(rpy_deg, dtype=np.float64)))
         for cup in cups:
+            current_cup_xyz_mm = current_tcp_xyz_mm + current_rotation @ cup.offset_tool_mm
             selected_offset_base_mm = rotation @ cup.offset_tool_mm
             tcp_approach_xyz_mm = physical_approach_xyz_mm - selected_offset_base_mm
             tcp_pickup_xyz_mm = physical_pickup_xyz_mm - selected_offset_base_mm
+
+            # The candidate-level workspace check is performed on the physical
+            # package point before cup compensation.  For the offset secondary
+            # cup, the commanded TCP can be hundreds of millimetres away from
+            # that point, so validate the actual A/contact TCP targets too.
+            if not point_in_workspace(tcp_approach_xyz_mm, args) or not point_in_workspace(
+                tcp_pickup_xyz_mm, args
+            ):
+                print(
+                    f"Rejecting suction plan outside configured TCP workspace: "
+                    f"cup={cup.name} RPY(deg)={np.asarray(rpy_deg).round(2).tolist()} "
+                    f"TCP_A(mm)={tcp_approach_xyz_mm.round(1).tolist()} "
+                    f"TCP_pickup(mm)={tcp_pickup_xyz_mm.round(1).tolist()}"
+                )
+                continue
             travel_mm = float(np.linalg.norm(tcp_approach_xyz_mm - current_tcp_xyz_mm))
+            cup_to_package_mm = float(
+                np.linalg.norm(physical_pickup_xyz_mm - current_cup_xyz_mm)
+            )
             transition_mm = float(np.linalg.norm(tcp_approach_xyz_mm - a_star_xyz_mm))
             radial_reach_mm = float(np.linalg.norm(tcp_approach_xyz_mm))
 
@@ -4178,7 +4402,13 @@ def build_suction_approach_plans(
             if np.isfinite(unused_clearance_mm):
                 clearance_penalty = max(0.0, preferred_clearance_mm - unused_clearance_mm) * 8.0
 
-            score = travel_mm + 0.35 * transition_mm + 0.20 * radial_reach_mm + clearance_penalty
+            score = (
+                travel_mm
+                + cup_to_package_mm
+                + 0.35 * transition_mm
+                + 0.20 * radial_reach_mm
+                + clearance_penalty
+            )
             plans.append(
                 SuctionApproachPlan(
                     cup=cup,
@@ -4188,39 +4418,39 @@ def build_suction_approach_plans(
                     rpy_mode=rpy_mode,
                     score=score,
                     travel_mm=travel_mm,
+                    cup_to_package_mm=cup_to_package_mm,
                     radial_reach_mm=radial_reach_mm,
                     unused_cup_clearance_mm=unused_clearance_mm,
                 )
             )
 
     primary_mode, primary_rpy_deg = rpy_candidates[0]
+
+    def orientation_priority(item: SuctionApproachPlan) -> int:
+        # Try both undirected package-long pickup orientations before the old
+        # fixed-X fallback. Either aligned branch makes the loaded D rotation
+        # approximately zero, while one branch can have much better IK for an
+        # offset secondary cup.
+        if item.rpy_mode.startswith("align_normal_package_long_for_d"):
+            return 0
+        if item.rpy_mode == primary_mode and np.allclose(
+            item.rpy_deg, primary_rpy_deg, atol=1e-6
+        ):
+            return 1
+        if item.rpy_mode == "align_normal_fixed_x":
+            return 2
+        return 3
+
     plans.sort(
         key=lambda item: (
-            0
-            if item.rpy_mode == primary_mode
-            and np.allclose(item.rpy_deg, primary_rpy_deg, atol=1e-6)
-            else 1,
+            orientation_priority(item),
             item.score,
         )
     )
-    fixed_plans = [
-        item
-        for item in plans
-        if item.rpy_mode == primary_mode
-        and np.allclose(item.rpy_deg, primary_rpy_deg, atol=1e-6)
-    ]
-    fallback_plans = [
-        item
-        for item in plans
-        if not (
-            item.rpy_mode == primary_mode
-            and np.allclose(item.rpy_deg, primary_rpy_deg, atol=1e-6)
-        )
-    ]
-    # Controller IK cannot be queried locally on this robot model, so each
-    # extra plan means a real controller rejection/round trip. Keep only the
-    # three best reach/path alternatives after both fixed-heading cups fail.
-    return fixed_plans + fallback_plans[:3]
+    # Controller IK cannot be queried locally on this robot model. Do not
+    # truncate the fallback list: a lower-ranked cup/yaw combination can be the
+    # only reachable solution near the edge of the real robot workspace.
+    return plans
 
 
 def waypoint_for_selected_cup(waypoint: RobotWaypoint, cup: SuctionCupSpec) -> RobotWaypoint:
@@ -4246,6 +4476,170 @@ def cup_center_at_tcp_waypoint(waypoint: RobotWaypoint, cup: SuctionCupSpec) -> 
     )
     tcp_xyz_mm = np.asarray([waypoint.x_mm, waypoint.y_mm, waypoint.z_mm], dtype=np.float64)
     return tcp_xyz_mm + rotation @ cup.offset_tool_mm
+
+
+def package_long_axis_base(candidate: ClusterCandidate) -> np.ndarray:
+    """Return the undirected package long axis projected into the base XY plane."""
+    if candidate.short_axis_base is None:
+        raise RuntimeError(
+            f"Candidate #{candidate.index} has no calibrated OBB edge direction; "
+            "long-edge placement cannot be guaranteed."
+        )
+
+    short_axis_xy = np.asarray(candidate.short_axis_base, dtype=np.float64).copy()
+    short_axis_xy[2] = 0.0
+    short_length = float(np.linalg.norm(short_axis_xy))
+    if short_length < 1e-6:
+        raise RuntimeError(
+            f"Candidate #{candidate.index} has a degenerate base-frame short edge; "
+            "long-edge placement cannot be guaranteed."
+        )
+    short_axis_xy /= short_length
+
+    # Rotating a short-edge direction by +90 degrees produces one of the two
+    # equivalent long-edge directions. The later angle calculation is modulo
+    # 180 degrees, so the OBB sign ambiguity does not change the result.
+    return np.asarray([-short_axis_xy[1], short_axis_xy[0], 0.0], dtype=np.float64)
+
+
+def wrap_undirected_angle_deg(angle_deg: float) -> float:
+    """Wrap an axis-alignment angle to [-90, 90), because long edges are undirected."""
+    return float((angle_deg + 90.0) % 180.0 - 90.0)
+
+
+def placement_local_z_delta_deg(
+    package_long_base: np.ndarray,
+    pickup_rotation: np.ndarray,
+    placement_reference_rotation: np.ndarray,
+) -> float:
+    """Compute the smallest local-Z turn that maps the package long edge to D tool Y."""
+    long_axis_tool = pickup_rotation.T @ np.asarray(package_long_base, dtype=np.float64)
+    tool_xy_length = float(np.linalg.norm(long_axis_tool[:2]))
+    if tool_xy_length < 1e-6:
+        raise RuntimeError("Package long edge is parallel to the pickup tool Z axis.")
+
+    # At the taught D pose, tool Y is the calibrated platform-long direction.
+    # Express that direction in the D reference frame so the implementation
+    # remains correct even though the taught D pose has small Rx/Ry offsets.
+    platform_long_base = placement_reference_rotation[:, 1]
+    desired_tool = placement_reference_rotation.T @ platform_long_base
+    current_angle_deg = float(np.degrees(np.arctan2(long_axis_tool[1], long_axis_tool[0])))
+    desired_angle_deg = float(np.degrees(np.arctan2(desired_tool[1], desired_tool[0])))
+    return wrap_undirected_angle_deg(desired_angle_deg - current_angle_deg)
+
+
+def rotate_waypoint_about_local_z(
+    waypoint: RobotWaypoint,
+    local_z_delta_deg: float,
+    *,
+    name: str | None = None,
+) -> RobotWaypoint:
+    """Apply a local suction-axis rotation without changing the physical cup-center point."""
+    reference_rotation = rpy_xyz_to_matrix(
+        np.radians([waypoint.rx_deg, waypoint.ry_deg, waypoint.rz_deg])
+    )
+    local_z_rotation = rpy_xyz_to_matrix(np.radians([0.0, 0.0, local_z_delta_deg]))
+    target_rotation = reference_rotation @ local_z_rotation
+    target_rpy_deg = np.degrees(matrix_to_rpy_xyz(target_rotation))
+    return RobotWaypoint(
+        name=name or f"{waypoint.name}[align-long-edge]",
+        x_mm=waypoint.x_mm,
+        y_mm=waypoint.y_mm,
+        z_mm=waypoint.z_mm,
+        rx_deg=float(target_rpy_deg[0]),
+        ry_deg=float(target_rpy_deg[1]),
+        rz_deg=float(target_rpy_deg[2]),
+    )
+
+
+def aligned_placement_waypoints(
+    candidate: ClusterCandidate,
+    pickup_rpy_deg: np.ndarray,
+) -> tuple[RobotWaypoint, RobotWaypoint, float, float]:
+    """Build safe-rotation and D poses that align package long edge to platform long edge."""
+    long_axis_base = package_long_axis_base(candidate)
+    pickup_rotation = rpy_xyz_to_matrix(np.radians(np.asarray(pickup_rpy_deg, dtype=np.float64)))
+    d_reference_rotation = rpy_xyz_to_matrix(
+        np.radians([WAYPOINT_D.rx_deg, WAYPOINT_D.ry_deg, WAYPOINT_D.rz_deg])
+    )
+    local_z_delta_deg = placement_local_z_delta_deg(
+        long_axis_base,
+        pickup_rotation,
+        d_reference_rotation,
+    )
+    safe_waypoint = rotate_waypoint_about_local_z(
+        WAYPOINT_D_ROTATE_SAFE,
+        local_z_delta_deg,
+        name="D-rotate-safe[align-long-edge]",
+    )
+    placement_waypoint = rotate_waypoint_about_local_z(
+        WAYPOINT_D,
+        local_z_delta_deg,
+        name="D[align-long-edge]",
+    )
+
+    placement_rotation = rpy_xyz_to_matrix(
+        np.radians(
+            [
+                placement_waypoint.rx_deg,
+                placement_waypoint.ry_deg,
+                placement_waypoint.rz_deg,
+            ]
+        )
+    )
+    long_axis_tool = pickup_rotation.T @ long_axis_base
+    predicted_long_base = placement_rotation @ long_axis_tool
+    predicted_long_xy = predicted_long_base[:2]
+    platform_long_xy = d_reference_rotation[:2, 1].copy()
+    predicted_long_xy /= max(1e-9, float(np.linalg.norm(predicted_long_xy)))
+    platform_long_xy /= max(1e-9, float(np.linalg.norm(platform_long_xy)))
+    alignment_error_deg = float(
+        np.degrees(
+            np.arccos(
+                np.clip(abs(float(np.dot(predicted_long_xy, platform_long_xy))), -1.0, 1.0)
+            )
+        )
+    )
+    return safe_waypoint, placement_waypoint, local_z_delta_deg, alignment_error_deg
+
+
+def placement_tcp_waypoint_for_selected_cup(
+    aligned_d_waypoint: RobotWaypoint,
+    cup: SuctionCupSpec,
+) -> tuple[RobotWaypoint, np.ndarray]:
+    """Keep the taught D TCP XY reachable and put the selected cup on the D height plane."""
+    rotation = rpy_xyz_to_matrix(
+        np.radians(
+            [
+                aligned_d_waypoint.rx_deg,
+                aligned_d_waypoint.ry_deg,
+                aligned_d_waypoint.rz_deg,
+            ]
+        )
+    )
+    cup_offset_base_mm = rotation @ cup.offset_tool_mm
+
+    # D is a physically taught TCP location. Fully compensating the secondary
+    # cup in XY pushed the TCP roughly 245 mm beyond D and outside this robot's
+    # reachable set. Keep the verified D TCP X/Y for either cup, but compensate
+    # Z so the package held by either cup reaches the same placement plane.
+    tcp_waypoint = RobotWaypoint(
+        name=f"{aligned_d_waypoint.name}[{cup.name}-placement]",
+        x_mm=aligned_d_waypoint.x_mm,
+        y_mm=aligned_d_waypoint.y_mm,
+        z_mm=float(aligned_d_waypoint.z_mm - cup_offset_base_mm[2]),
+        rx_deg=aligned_d_waypoint.rx_deg,
+        ry_deg=aligned_d_waypoint.ry_deg,
+        rz_deg=aligned_d_waypoint.rz_deg,
+    )
+    selected_cup_center_mm = cup_center_at_tcp_waypoint(tcp_waypoint, cup)
+    if abs(float(selected_cup_center_mm[2] - aligned_d_waypoint.z_mm)) > 0.5:
+        raise RuntimeError(
+            f"{cup.name} placement Z compensation failed: "
+            f"cup_z={selected_cup_center_mm[2]:.3f}mm "
+            f"platform_z={aligned_d_waypoint.z_mm:.3f}mm"
+        )
+    return tcp_waypoint, selected_cup_center_mm
 
 
 def require_selected_cup_at_functional_waypoint(
@@ -4278,15 +4672,20 @@ def functional_waypoint_candidates_for_cup(
     physical_waypoint: RobotWaypoint,
     cup: SuctionCupSpec,
     current_tcp_xyz_mm: np.ndarray,
+    current_tcp_rpy_deg: np.ndarray,
     *,
     prefer_original_orientation: bool,
+    allow_yaw_alternatives: bool = True,
 ) -> list[RobotWaypoint]:
     """Create same-center functional poses with yaw-only IK alternatives."""
     original_tcp_waypoint = waypoint_for_selected_cup(physical_waypoint, cup)
-    if float(np.linalg.norm(cup.offset_tool_mm)) < 1e-6:
+    if not allow_yaw_alternatives or float(np.linalg.norm(cup.offset_tool_mm)) < 1e-6:
         return [original_tcp_waypoint]
 
-    alternatives: list[tuple[float, RobotWaypoint]] = []
+    current_rotation = rpy_xyz_to_matrix(
+        np.radians(np.asarray(current_tcp_rpy_deg, dtype=np.float64))
+    )
+    alternatives: list[tuple[float, float, RobotWaypoint]] = []
     original_rotation = rpy_xyz_to_matrix(
         np.radians(
             [
@@ -4319,24 +4718,31 @@ def functional_waypoint_candidates_for_cup(
         )
         radial_reach_mm = float(np.linalg.norm(tcp_xyz_mm))
         travel_mm = float(np.linalg.norm(tcp_xyz_mm - current_tcp_xyz_mm))
-        score = radial_reach_mm + 0.25 * travel_mm
-        alternatives.append((score, tcp_waypoint))
+        geometry_score = radial_reach_mm + 0.25 * travel_mm
+        orientation_distance_deg = rotation_distance_deg(current_rotation, variant_rotation)
+        alternatives.append((orientation_distance_deg, geometry_score, tcp_waypoint))
 
-    alternatives.sort(key=lambda item: item[0])
-    best_alternatives = [item[1] for item in alternatives[:3]]
     if prefer_original_orientation:
-        return [original_tcp_waypoint, *best_alternatives]
+        alternatives.sort(key=lambda item: (item[0], item[1]))
+        return [original_tcp_waypoint, *(item[2] for item in alternatives)]
 
     original_xyz_mm = np.asarray(
         [original_tcp_waypoint.x_mm, original_tcp_waypoint.y_mm, original_tcp_waypoint.z_mm],
         dtype=np.float64,
     )
-    original_score = float(np.linalg.norm(original_xyz_mm)) + 0.25 * float(
+    original_geometry_score = float(np.linalg.norm(original_xyz_mm)) + 0.25 * float(
         np.linalg.norm(original_xyz_mm - current_tcp_xyz_mm)
     )
-    ranked = [(original_score, original_tcp_waypoint), *alternatives[:3]]
-    ranked.sort(key=lambda item: item[0])
-    return [item[1] for item in ranked]
+    original_rotation_distance_deg = rotation_distance_deg(current_rotation, original_rotation)
+    # In-plane yaw is functionally free at C, but a 120-degree turn is not a
+    # sensible first choice from B. Prefer the shortest orientation change;
+    # use reach/travel only as a tie-breaker, and retain all safe fallbacks.
+    ranked = [
+        (original_rotation_distance_deg, original_geometry_score, original_tcp_waypoint),
+        *alternatives,
+    ]
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
 
 
 def move_selected_cup_to_functional_waypoint(
@@ -4346,13 +4752,19 @@ def move_selected_cup_to_functional_waypoint(
     motion_options: MotionOptions,
     *,
     prefer_original_orientation: bool,
+    allow_yaw_alternatives: bool = True,
+    allow_current_conf_movej_fallback: bool = True,
 ) -> tuple[RobotWaypoint, np.ndarray]:
-    current_tcp_xyz_mm = robot.read_current_pose().translation_mm()
+    current_pose = robot.read_current_pose()
+    current_tcp_xyz_mm = current_pose.translation_mm()
+    current_tcp_rpy_deg = current_pose.rpy_deg_xyz()
     candidates = functional_waypoint_candidates_for_cup(
         physical_waypoint,
         cup,
         current_tcp_xyz_mm,
+        current_tcp_rpy_deg,
         prefer_original_orientation=prefer_original_orientation,
+        allow_yaw_alternatives=allow_yaw_alternatives,
     )
     last_error: Exception | None = None
     for rank, tcp_waypoint in enumerate(candidates, start=1):
@@ -4377,15 +4789,25 @@ def move_selected_cup_to_functional_waypoint(
                 tcp_waypoint,
                 robot,
                 motion_options,
+                allow_current_conf_movej_fallback=allow_current_conf_movej_fallback,
             )
             return tcp_waypoint, cup_center_mm
         except Exception as exc:
             last_error = exc
-            if not is_no_ik_solution_error(exc):
+            if is_operator_software_stop_error(exc) or is_robot_power_or_safety_state_error(exc):
+                raise
+            retry_reason = None
+            if is_no_ik_solution_error(exc):
+                retry_reason = "no IK"
+            elif is_unsafe_rpy_step_error(exc):
+                retry_reason = "unsafe orientation step"
+            elif is_path_singularity_error(exc):
+                retry_reason = "path singularity"
+            if retry_reason is None:
                 raise
             print(
-                f"Functional {physical_waypoint.name} plan #{rank} has no IK; "
-                "trying the next yaw-only plan while keeping the same physical center. "
+                f"Functional {physical_waypoint.name} plan #{rank} rejected ({retry_reason}); "
+                "trying the next shorter/safe yaw plan while keeping the same physical center. "
                 f"Controller error: {exc}"
             )
     raise RuntimeError(
@@ -4394,9 +4816,61 @@ def move_selected_cup_to_functional_waypoint(
     )
 
 
+def rotate_selected_cup_at_functional_waypoint(
+    physical_reference_waypoint: RobotWaypoint,
+    local_z_delta_deg: float,
+    cup: SuctionCupSpec,
+    robot: XCoreRobotClient,
+    motion_options: MotionOptions,
+    *,
+    max_step_deg: float = 10.0,
+) -> tuple[RobotWaypoint, np.ndarray]:
+    """Rotate in small compensated steps so an offset cup stays at the physical center."""
+    if max_step_deg <= 0.0 or not np.isfinite(max_step_deg):
+        raise ValueError("max_step_deg must be a positive finite value.")
+    step_count = max(1, int(np.ceil(abs(local_z_delta_deg) / max_step_deg)))
+    reached_waypoint: RobotWaypoint | None = None
+    cup_center_mm: np.ndarray | None = None
+    for step_index in range(1, step_count + 1):
+        step_delta_deg = local_z_delta_deg * step_index / step_count
+        step_waypoint = rotate_waypoint_about_local_z(
+            physical_reference_waypoint,
+            step_delta_deg,
+            name=(
+                f"{physical_reference_waypoint.name}[align-long-edge "
+                f"{step_index}/{step_count}]"
+            ),
+        )
+        print(
+            f"Selected-cup rotation step {step_index}/{step_count}: "
+            f"cup={cup.name} local-Z={step_delta_deg:+.2f}deg."
+        )
+        reached_waypoint, cup_center_mm = move_selected_cup_to_functional_waypoint(
+            step_waypoint,
+            cup,
+            robot,
+            motion_options,
+            prefer_original_orientation=True,
+            allow_yaw_alternatives=False,
+            allow_current_conf_movej_fallback=False,
+        )
+    if reached_waypoint is None or cup_center_mm is None:
+        raise RuntimeError("Selected-cup rotation produced no motion step.")
+    return reached_waypoint, cup_center_mm
+
+
 def is_no_ik_solution_error(exc: Exception) -> bool:
     message = str(exc)
     return "-50021" in message or "50021" in message
+
+
+def is_unsafe_rpy_step_error(exc: Exception) -> bool:
+    return "Unsafe RPY step" in str(exc)
+
+
+def is_path_singularity_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "-50102" in message or "50102" in message or "奇异点" in message
 
 
 def compute_approach_geometry(
@@ -4429,6 +4903,44 @@ def compute_approach_geometry(
     return approach_xyz_mm, pickup_xyz_mm, target_rpy_deg, rpy_mode, rpy_candidates
 
 
+def move_approach_down_to_pickup(
+    robot: XCoreRobotClient,
+    approach_xyz_mm: np.ndarray,
+    pickup_xyz_mm: np.ndarray,
+    target_rpy_deg: np.ndarray,
+    linear_options: MotionOptions,
+):
+    """Validate a suction plan through its pickup endpoint while suction is off."""
+    descent_start_pose = robot.read_current_pose()
+    print(
+        f"Descending A -> pickup by {float(np.linalg.norm(pickup_xyz_mm - approach_xyz_mm)):.1f} mm: "
+        f"start XYZ(mm)={descent_start_pose.translation_mm().round(1).tolist()} "
+        f"target XYZ(mm)={pickup_xyz_mm.round(1).tolist()}"
+    )
+    pickup_pose = move_pose_with_singularity_fallback(
+        robot,
+        float(pickup_xyz_mm[0]),
+        float(pickup_xyz_mm[1]),
+        float(pickup_xyz_mm[2]),
+        float(target_rpy_deg[0]),
+        float(target_rpy_deg[1]),
+        float(target_rpy_deg[2]),
+        linear_options,
+        allow_clear_confdata_retry=False,
+        allow_movej_singularity_retry=False,
+    )
+    pickup_error_mm = float(np.linalg.norm(pickup_pose.translation_mm() - pickup_xyz_mm))
+    actual_descent_mm = float(
+        np.linalg.norm(pickup_pose.translation_mm() - descent_start_pose.translation_mm())
+    )
+    print(
+        f"Pickup descent complete: actual TCP travel={actual_descent_mm:.1f} mm "
+        f"final XYZ(mm)={pickup_pose.translation_mm().round(1).tolist()} "
+        f"target_error={pickup_error_mm:.1f} mm"
+    )
+    return pickup_pose
+
+
 def execute_candidate_sequence(
     candidate: ClusterCandidate,
     robot: XCoreRobotClient,
@@ -4442,6 +4954,23 @@ def execute_candidate_sequence(
     if not candidate.motion_safe:
         print(f"Candidate #{candidate.index} is blocked for batch motion: {candidate.filter_note}")
         return False, None, False
+
+    # Long-edge alignment is mandatory for a completed package. Validate the
+    # detected axis before suction so a missing/degenerate OBB cannot leave us
+    # holding a package whose required placement orientation is unknown.
+    try:
+        detected_long_axis_base = package_long_axis_base(candidate)
+    except Exception as exc:
+        print(
+            f"Candidate #{candidate.index} cannot satisfy long-edge placement; "
+            f"skipping it before suction. Reason: {exc}"
+        )
+        return True, None, False
+    print(
+        f"Candidate #{candidate.index} package long edge (base XY)="
+        f"{detected_long_axis_base.round(4).tolist()}; "
+        "target at D is parallel to the taught D tool Y axis."
+    )
 
     try:
         approach_xyz_mm, pickup_xyz_mm, target_rpy_deg, rpy_mode, rpy_candidates = compute_approach_geometry(
@@ -4477,20 +5006,20 @@ def execute_candidate_sequence(
         pass_through_zone_mm = max(0.0, float(args.pass_through_zone_mm))
 
         print(
-            f"Pickup orientation: prefer fixed tool X heading RZ={FIXED_GRASP_X_YAW_DEG:.2f} deg; "
-            "tool Y and package short-edge directions are ignored. If both fixed-heading cup "
-            "plans have no IK, limited yaw-only fallbacks are allowed while the suction face "
-            "remains aligned down."
+            "Pickup orientation: first align tool Y with the detected package long edge so "
+            "the loaded rotation required at D is approximately zero. Both 180-degree-equivalent "
+            f"branches are tried before the legacy fixed-X RZ={FIXED_GRASP_X_YAW_DEG:.2f} deg "
+            "and yaw-only IK fallbacks; the suction face remains horizontal."
         )
 
         suction_active = False
         selected_suction_name = "primary"
         selected_suction_port = int(args.suction_do_port)
         selected_suction_cup = suction_cup_specs(args)[0]
-        selection_origin_xyz_mm = robot.read_current_pose().translation_mm()
         selected_rpy_deg: np.ndarray | None = None
         selected_rpy_mode = rpy_mode
         last_approach_error: Exception | None = None
+        pickup_pose = None
         if prepositioned_approach is not None and prepositioned_approach.candidate_index == candidate.index:
             approach_xyz_mm = prepositioned_approach.approach_xyz_mm
             pickup_xyz_mm = prepositioned_approach.pickup_xyz_mm
@@ -4530,10 +5059,17 @@ def execute_candidate_sequence(
                 "Replanned pickup orientation from the actual B pose: "
                 f"RPY(deg)={target_rpy_deg.round(2).tolist()} mode={rpy_mode}"
             )
+            # Rank travel and cup-to-package distances from the same actual B
+            # pose used for orientation replanning. Reading this before the
+            # B route produces stale and misleading dual-cup scores.
+            selection_origin_pose = robot.read_current_pose()
+            selection_origin_xyz_mm = selection_origin_pose.translation_mm()
+            selection_origin_rpy_deg = selection_origin_pose.rpy_deg_xyz()
             suction_plans = build_suction_approach_plans(
                 candidate,
                 scene_candidates or [candidate],
                 selection_origin_xyz_mm,
+                selection_origin_rpy_deg,
                 approach_xyz_mm,
                 pickup_xyz_mm,
                 rpy_candidates,
@@ -4552,10 +5088,11 @@ def execute_candidate_sequence(
                         f"TCP_A(mm)={suction_plan.approach_xyz_mm.round(1).tolist()} "
                         f"RPY(deg)={suction_plan.rpy_deg.round(2).tolist()} "
                         f"travel={suction_plan.travel_mm:.1f}mm "
+                        f"cup_to_package={suction_plan.cup_to_package_mm:.1f}mm "
                         f"reach={suction_plan.radial_reach_mm:.1f}mm "
                         f"unused_clearance={clearance_text} score={suction_plan.score:.1f}"
                     )
-                    move_empty_approach_to_a(
+                    commanded_rpy_deg = move_empty_approach_to_a(
                         robot,
                         suction_plan.approach_xyz_mm,
                         suction_plan.rpy_deg,
@@ -4563,16 +5100,44 @@ def execute_candidate_sequence(
                     )
                     approach_xyz_mm = suction_plan.approach_xyz_mm
                     pickup_xyz_mm = suction_plan.pickup_xyz_mm
-                    selected_rpy_deg = suction_plan.rpy_deg
+                    # Reuse the continuous equivalent at pickup so the short
+                    # MoveL descent cannot numerically wrap back by 360 deg.
+                    selected_rpy_deg = commanded_rpy_deg
                     selected_rpy_mode = suction_plan.rpy_mode
                     selected_suction_name = suction_plan.cup.name
                     selected_suction_port = suction_plan.cup.do_port
                     selected_suction_cup = suction_plan.cup
+                    # Reaching A alone does not prove that the vertical contact
+                    # endpoint is reachable. Validate the complete pre-suction
+                    # path before accepting this cup/orientation plan.
+                    pickup_pose = move_approach_down_to_pickup(
+                        robot,
+                        approach_xyz_mm,
+                        pickup_xyz_mm,
+                        selected_rpy_deg,
+                        linear_options,
+                    )
                     break
                 except Exception as exc:
                     last_approach_error = exc
+                    selected_rpy_deg = None
+                    pickup_pose = None
                     if suction_active:
                         raise
+                    if is_operator_software_stop_error(exc):
+                        raise RuntimeError(
+                            "Operator software stop is latched; aborting the complete batch "
+                            "without trying another suction plan or package."
+                        ) from exc
+                    if is_robot_power_or_safety_state_error(exc):
+                        raise RuntimeError(
+                            "Robot power/safety state no longer permits motion; aborting all "
+                            "remaining suction/orientation plans instead of repeatedly commanding it. "
+                            f"Controller error: {exc}"
+                        ) from exc
+                    # Clear the rejected/partial motion before routing back
+                    # through A* for the next independently reachable plan.
+                    robot.stop_motion()
                     print(
                         f"Dual-suction plan #{rank} ({suction_plan.cup.name}) failed before suction; "
                         "trying the next cup/pose plan. "
@@ -4598,36 +5163,24 @@ def execute_candidate_sequence(
             f"selected cup={selected_suction_name} DO{args.suction_do_board}_{selected_suction_port}"
         )
 
-        # The vertical pickup and retraction are linear whenever the
-        # controller accepts the trajectory; the helper falls back to MoveJ
-        # only for a controller-reported singularity.
-        descent_start_pose = robot.read_current_pose()
-        print(
-            f"Descending A -> pickup by {float(np.linalg.norm(pickup_xyz_mm - approach_xyz_mm)):.1f} mm: "
-            f"start XYZ(mm)={descent_start_pose.translation_mm().round(1).tolist()} "
-            f"target XYZ(mm)={pickup_xyz_mm.round(1).tolist()}"
-        )
-        pickup_pose = move_pose_with_singularity_fallback(
-            robot,
-            float(pickup_xyz_mm[0]),
-            float(pickup_xyz_mm[1]),
-            float(pickup_xyz_mm[2]),
-            float(target_rpy_deg[0]),
-            float(target_rpy_deg[1]),
-            float(target_rpy_deg[2]),
-            linear_options,
-            allow_clear_confdata_retry=False,
-            allow_movej_singularity_retry=False,
-        )
-        pickup_error_mm = float(np.linalg.norm(pickup_pose.translation_mm() - pickup_xyz_mm))
-        actual_descent_mm = float(
-            np.linalg.norm(pickup_pose.translation_mm() - descent_start_pose.translation_mm())
-        )
-        print(
-            f"Pickup descent complete: actual TCP travel={actual_descent_mm:.1f} mm "
-            f"final XYZ(mm)={pickup_pose.translation_mm().round(1).tolist()} "
-            f"target_error={pickup_error_mm:.1f} mm"
-        )
+        # A prepositioned next candidate has already validated only its A point;
+        # validate its pickup endpoint here. Normal plans did this in the loop.
+        if pickup_pose is None:
+            try:
+                pickup_pose = move_approach_down_to_pickup(
+                    robot,
+                    approach_xyz_mm,
+                    pickup_xyz_mm,
+                    target_rpy_deg,
+                    linear_options,
+                )
+            except Exception as exc:
+                print(
+                    f"Candidate #{candidate.index} prepositioned pickup endpoint is unreachable; "
+                    "skipping this package and continuing with the next one. "
+                    f"Controller error: {exc}"
+                )
+                return True, None, False
         print(
             f"At pickup point for candidate #{candidate.index}; "
             f"enabling {selected_suction_name} suction "
@@ -4716,8 +5269,9 @@ def execute_candidate_sequence(
             selected_suction_cup,
             robot,
             linear_options,
-            # Bottom inspection is invariant to in-plane package yaw. Rank
-            # reachable TCP geometry first for the offset secondary cup.
+            # Bottom inspection is invariant to in-plane package yaw. Prefer
+            # the shortest orientation change from B, then use TCP geometry
+            # to break ties for the offset secondary cup.
             prefer_original_orientation=False,
         )
         if waybill_inspector is not None:
@@ -4737,15 +5291,75 @@ def execute_candidate_sequence(
             )
             wait_with_operator_stop(actual_c_hold_s, robot, stop_options)
 
-        print("Moving from C to placement point D; D remains a stop/dwell point.")
-        loaded_waypoint_d, selected_cup_center_d_mm = move_selected_cup_to_functional_waypoint(
-            WAYPOINT_D,
+        (
+            aligned_rotate_safe,
+            aligned_waypoint_d,
+            placement_delta_deg,
+            predicted_alignment_error_deg,
+        ) = aligned_placement_waypoints(candidate, pickup_pose.rpy_deg_xyz())
+        print(
+            f"Long-edge placement plan for candidate #{candidate.index}: "
+            f"local suction-axis turn={placement_delta_deg:+.2f}deg, "
+            f"predicted platform alignment error={predicted_alignment_error_deg:.3f}deg."
+        )
+        print(
+            "Moving from C to the verified high rotation point first; the calculated "
+            "local-Z turn is then executed around the selected physical cup center."
+        )
+        move_selected_cup_to_functional_waypoint(
+            WAYPOINT_D_ROTATE_SAFE,
             selected_suction_cup,
             robot,
             stop_options,
-            # Preserve the taught placement yaw whenever it is reachable;
-            # yaw-only alternatives are a last resort.
             prefer_original_orientation=True,
+            allow_yaw_alternatives=False,
+        )
+        if abs(placement_delta_deg) >= 0.05:
+            print(
+                f"Rotating package at the verified high point by "
+                f"{placement_delta_deg:+.2f}deg about the selected suction axis."
+            )
+            rotated_safe_tcp, _rotated_safe_cup_center = rotate_selected_cup_at_functional_waypoint(
+                WAYPOINT_D_ROTATE_SAFE,
+                placement_delta_deg,
+                selected_suction_cup,
+                robot,
+                stop_options,
+            )
+            expected_safe_rotation = rpy_xyz_to_matrix(
+                np.radians(
+                    [
+                        aligned_rotate_safe.rx_deg,
+                        aligned_rotate_safe.ry_deg,
+                        aligned_rotate_safe.rz_deg,
+                    ]
+                )
+            )
+            reached_safe_rotation = rpy_xyz_to_matrix(
+                np.radians(
+                    [
+                        rotated_safe_tcp.rx_deg,
+                        rotated_safe_tcp.ry_deg,
+                        rotated_safe_tcp.rz_deg,
+                    ]
+                )
+            )
+            if not np.allclose(reached_safe_rotation, expected_safe_rotation, atol=1e-7):
+                raise RuntimeError("Segmented safe-point rotation did not reach the planned orientation.")
+        print("Moving from the aligned high point to D without restoring the taught D yaw.")
+        loaded_waypoint_d, selected_cup_center_d_mm = placement_tcp_waypoint_for_selected_cup(
+            aligned_waypoint_d,
+            selected_suction_cup,
+        )
+        print(
+            f"Placement D uses the taught reachable TCP XY for {selected_suction_name}: "
+            f"TCP(mm)={[round(loaded_waypoint_d.x_mm, 1), round(loaded_waypoint_d.y_mm, 1), round(loaded_waypoint_d.z_mm, 1)]} "
+            f"selected_cup_center(mm)={selected_cup_center_d_mm.round(1).tolist()}."
+        )
+        move_loaded_transfer_with_singularity_fallback(
+            loaded_waypoint_d,
+            robot,
+            stop_options,
         )
         print(
             f"At functional placement D for candidate #{candidate.index}; "
@@ -4761,52 +5375,79 @@ def execute_candidate_sequence(
 
         next_approach_plan: ApproachPlan | None = None
         if next_candidate is not None and next_candidate.motion_safe:
-            (
-                next_approach_xyz_mm,
-                next_pickup_xyz_mm,
-                next_target_rpy_deg,
-                next_rpy_mode,
-                next_rpy_candidates,
-            ) = compute_approach_geometry(next_candidate, robot, args)
             print(
                 f"Returning empty through C/B and continuing directly to "
                 f"candidate #{next_candidate.index} A point."
             )
             move_waypoint(WAYPOINT_C, robot, approach_options)
             move_waypoint(WAYPOINT_B, robot, approach_options)
+
+            # Replan from the actual B pose, then run the same dual-cup
+            # selection used on a normal candidate turn. The old shortcut
+            # prepositioned every next candidate with the primary cup and
+            # bypassed secondary-cup scoring entirely.
+            (
+                next_approach_xyz_mm,
+                next_pickup_xyz_mm,
+                _next_target_rpy_deg,
+                _next_rpy_mode,
+                next_rpy_candidates,
+            ) = compute_approach_geometry(next_candidate, robot, args)
+            next_selection_origin_pose = robot.read_current_pose()
+            next_suction_plans = build_suction_approach_plans(
+                next_candidate,
+                scene_candidates or [next_candidate],
+                next_selection_origin_pose.translation_mm(),
+                next_selection_origin_pose.rpy_deg_xyz(),
+                next_approach_xyz_mm,
+                next_pickup_xyz_mm,
+                next_rpy_candidates,
+                args,
+            )
             last_next_error: Exception | None = None
-            for next_candidate_rpy_mode, next_candidate_rpy_deg in next_rpy_candidates:
+            for next_suction_plan in next_suction_plans:
                 try:
                     print(
-                        f"Trying next approach orientation {next_candidate_rpy_mode}: "
-                        f"RPY(deg)={next_candidate_rpy_deg.round(2).tolist()}"
+                        f"Trying next dual-suction approach: cup={next_suction_plan.cup.name} "
+                        f"DO{args.suction_do_board}_{next_suction_plan.cup.do_port} "
+                        f"RPY(deg)={next_suction_plan.rpy_deg.round(2).tolist()} "
+                        f"score={next_suction_plan.score:.1f}"
                     )
-                    move_empty_approach_to_a(
+                    next_commanded_rpy_deg = move_empty_approach_to_a(
                         robot,
-                        next_approach_xyz_mm,
-                        next_candidate_rpy_deg,
+                        next_suction_plan.approach_xyz_mm,
+                        next_suction_plan.rpy_deg,
                         approach_options,
                     )
                     next_approach_plan = ApproachPlan(
                         candidate_index=next_candidate.index,
-                        approach_xyz_mm=next_approach_xyz_mm,
-                        pickup_xyz_mm=next_pickup_xyz_mm,
-                        rpy_deg=next_candidate_rpy_deg,
-                        rpy_mode=next_candidate_rpy_mode,
-                        suction_name="primary",
-                        suction_do_port=int(args.suction_do_port),
+                        approach_xyz_mm=next_suction_plan.approach_xyz_mm,
+                        pickup_xyz_mm=next_suction_plan.pickup_xyz_mm,
+                        rpy_deg=next_commanded_rpy_deg,
+                        rpy_mode=next_suction_plan.rpy_mode,
+                        suction_name=next_suction_plan.cup.name,
+                        suction_do_port=next_suction_plan.cup.do_port,
                     )
                     break
                 except Exception as exc:
                     last_next_error = exc
+                    if is_operator_software_stop_error(exc):
+                        raise RuntimeError(
+                            "Operator software stop is latched; aborting next-candidate "
+                            "prepositioning and the complete batch."
+                        ) from exc
+                    if is_robot_power_or_safety_state_error(exc):
+                        raise
                     print(
-                        f"Next approach orientation {next_candidate_rpy_mode} failed; "
-                        "the next package will be approached from the current pose on its own turn."
+                        f"Next dual-suction approach with {next_suction_plan.cup.name} failed; "
+                        "trying the next cup/pose plan. "
+                        f"Controller error: {exc}"
                     )
             if next_approach_plan is None:
                 print(
                     f"Next candidate #{next_candidate.index} was not prepositioned; "
-                    "the batch will continue with a fresh approach on that candidate."
+                    "the batch will continue with a fresh approach on that candidate. "
+                    f"Last controller error: {last_next_error}"
                 )
         else:
             print(
@@ -4951,7 +5592,7 @@ def print_analysis_summary(analysis: AnalysisResult, args: argparse.Namespace) -
         if candidate.short_axis_base is not None:
             print(
                 f"      YOLO short edge (base)={candidate.short_axis_base.round(4).tolist()} "
-                "(reported for diagnostics only; not used for grasp orientation)"
+                "(used to pre-orient pickup for long-edge placement at D)"
             )
 
 
@@ -5068,6 +5709,7 @@ def main() -> int:
     )
     print(f"Robot motion settings: speed={args.robot_speed_mm_s:.1f} mm/s zone={args.robot_zone_mm:.1f} mm")
     operator_stop_requested = False
+    operator_stop_lock = threading.Lock()
 
     if not args.dry_run:
         try:
@@ -5154,10 +5796,21 @@ def main() -> int:
 
     def request_operator_stop(reason: str = "SPACE") -> None:
         nonlocal operator_stop_requested, batch_auto_enabled
-        if not operator_stop_requested:
-            print(f"{reason} pressed: requesting robot software stop and aborting the current batch.")
-        operator_stop_requested = True
-        batch_auto_enabled = False
+        with operator_stop_lock:
+            first_request = not operator_stop_requested
+            operator_stop_requested = True
+            batch_auto_enabled = False
+        if not first_request:
+            return
+        print(
+            f"{reason} pressed: stopping robot motion, clearing queued commands, "
+            "and aborting continuous batch mode. Suction outputs are intentionally kept unchanged."
+        )
+        if robot is not None:
+            try:
+                robot.stop_motion()
+            except Exception as exc:
+                print(f"Warning: immediate robot software stop failed: {exc}")
 
     def request_quit() -> None:
         nonlocal quit_requested
@@ -5167,12 +5820,20 @@ def main() -> int:
     def poll_operator_stop_key() -> bool:
         key = cv2.waitKey(1) & 0xFF
         if key == 32:
-            request_operator_stop()
+            request_operator_stop("SPACE")
         elif key == ord("q"):
             request_quit()
         return operator_stop_requested
 
     motion_options.stop_requested = poll_operator_stop_key
+    space_stop_monitor = GlobalSpaceStopMonitor(lambda: request_operator_stop("GLOBAL SPACE"))
+    if space_stop_monitor.start():
+        print(
+            "Global SPACE software stop enabled: press Space at any time to stop motion and "
+            "clear queued commands (suction remains unchanged)."
+        )
+    else:
+        print("SPACE software stop is available only while an OpenCV window has keyboard focus.")
 
     def schedule_next_analysis() -> None:
         nonlocal next_analysis_time
@@ -5370,9 +6031,7 @@ def main() -> int:
                 request_quit()
                 break
             if key == 32:
-                request_operator_stop()
-                if robot is not None:
-                    robot.stop_motion()
+                request_operator_stop("SPACE")
                 continue
             if key in (ord("m"), ord("b"), ord("1"), ord("2"), ord("3"), ord("4")):
                 if key == ord("m"):
@@ -5484,7 +6143,8 @@ def main() -> int:
                 if roi_edit_target is not None:
                     print("Finish ROI editing first with c/Enter, or press Esc to cancel.")
                     continue
-                operator_stop_requested = False
+                with operator_stop_lock:
+                    operator_stop_requested = False
                 if not batch_auto_enabled:
                     batch_auto_enabled = True
                     print("Continuous batch mode enabled: future refreshed detections will run automatically.")
@@ -5503,6 +6163,7 @@ def main() -> int:
                 if quit_requested:
                     break
     finally:
+        space_stop_monitor.stop()
         cv2.destroyAllWindows()
         camera.stop()
         if waybill_inspector is not None:
