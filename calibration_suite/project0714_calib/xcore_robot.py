@@ -206,6 +206,18 @@ class XCoreRobotClient:
         _sdk_call(self.xcore, "setDefaultSpeed", self.ec, self.robot.setDefaultSpeed, speed_mm_s)
         _sdk_call(self.xcore, "setDefaultZone", self.ec, self.robot.setDefaultZone, zone_mm)
 
+    def set_conf_data_forced(self, forced: bool) -> None:
+        """Explicitly select the controller's configuration-solving policy.
+
+        Clearing CartesianPosition.confData alone does not set this switch.
+        False asks the controller for the solution nearest its current joints.
+        """
+        self.connect()
+        _sdk_call(
+            self.xcore, "setDefaultConfOpt", self.ec,
+            self.robot.setDefaultConfOpt, bool(forced),
+        )
+
     def read_current_pose(self) -> RobotPose:
         self.connect()
         posture = _sdk_call(

@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 import json
+import os
 import time
 from collections.abc import Iterator
 import cv2
@@ -39,7 +40,9 @@ class AsyncWaybillInspector:
         password: str,
         model_path: str | Path,
         output_dir: str | Path,
+        barcode_model_path: str | Path | None = None,
         confidence: float = 0.5,
+        barcode_confidence: float = 0.25,
         capture_count: int = 100,
         capture_interval_s: float = 0.1,
         capture_duration_s: float = 30.0,
@@ -47,11 +50,16 @@ class AsyncWaybillInspector:
         post_c_capture_s: float = 2.5,
         request_timeout_s: float = 1.0,
         waybill_class_id: int = 0,
+        barcode_class_id: int = 0,
+        allow_single_frame_result: bool = False,
         result_callback: Callable[[WaybillInspectionResult], None] | None = None,
     ) -> None:
         if not password:
             raise ValueError("Hikvision password is empty.")
 
+        config_dir = Path(output_dir) / ".ultralytics"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("YOLO_CONFIG_DIR", str(config_dir))
         try:
             import zxingcpp
             from ultralytics import YOLO
@@ -64,6 +72,7 @@ class AsyncWaybillInspector:
         self.username = username
         self.password = password
         self.confidence = float(confidence)
+        self.barcode_confidence = float(barcode_confidence)
         self.capture_count = max(1, int(capture_count))
         self.capture_interval_s = max(0.02, float(capture_interval_s))
         self.capture_duration_s = max(
@@ -73,10 +82,19 @@ class AsyncWaybillInspector:
         self.post_c_capture_s = max(0.0, float(post_c_capture_s))
         self.request_timeout_s = max(0.1, float(request_timeout_s))
         self.waybill_class_id = int(waybill_class_id)
+        self.barcode_class_id = int(barcode_class_id)
+        self.allow_single_frame_result = bool(allow_single_frame_result)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._zxingcpp = zxingcpp
         self._model = YOLO(str(model_path))
+        self._barcode_model = (
+            YOLO(str(barcode_model_path)) if barcode_model_path is not None else None
+        )
+        if self._barcode_model is not None and self._barcode_model.task != "obb":
+            raise ValueError(
+                f"Barcode model must be an OBB model, got task={self._barcode_model.task!r}."
+            )
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="waybill-decode"
         )
@@ -95,6 +113,9 @@ class AsyncWaybillInspector:
         """Capture a fixed-duration clip and submit it automatically for inspection."""
         self.cancel_capture()
         with self._lock:
+            # A second C-point view for the same parcel must not return the
+            # completed result from the first view.
+            self._futures.pop(int(candidate_index), None)
             self._capture_generation += 1
             generation = self._capture_generation
             self._active_candidate = int(candidate_index)
@@ -127,6 +148,32 @@ class AsyncWaybillInspector:
             self._frames.clear()
 
         return self._submit_frames(int(candidate_index), frames)
+
+    def wait_for_result(
+        self,
+        candidate_index: int,
+        timeout_s: float,
+    ) -> WaybillInspectionResult:
+        """Return the completed inspection result for the current C-point capture."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        future: Future[WaybillInspectionResult] | None = None
+        while future is None:
+            with self._lock:
+                future = self._futures.get(int(candidate_index))
+            if future is not None:
+                break
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise TimeoutError(
+                    f"Timed out waiting for C-point inspection of candidate #{candidate_index}."
+                )
+            time.sleep(min(0.02, remaining_s))
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0.0:
+            raise TimeoutError(
+                f"Timed out waiting for C-point inspection of candidate #{candidate_index}."
+            )
+        return future.result(timeout=remaining_s)
 
     def cancel_capture(self) -> None:
         with self._lock:
@@ -226,7 +273,8 @@ class AsyncWaybillInspector:
         future = self._executor.submit(
             self._inspect_frames, int(candidate_index), frames
         )
-        self._futures[int(candidate_index)] = future
+        with self._lock:
+            self._futures[int(candidate_index)] = future
         future.add_done_callback(self._handle_future)
         return future
 
@@ -275,7 +323,6 @@ class AsyncWaybillInspector:
             / f"candidate_{candidate_index}_{datetime.now():%Y%m%d_%H%M%S_%f}"
         )
         run_dir.mkdir(parents=True, exist_ok=True)
-        self._save_video(run_dir / "c_camera_capture.mp4", frames)
         full_frame_sharpness: list[float] = []
         for frame in frames:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -407,6 +454,21 @@ class AsyncWaybillInspector:
                 f"frames={dict(frame_ranked)}, "
                 f"fusion={dict(fusion_ranked)}"
             )
+
+            # Offline single-image inspection has no second physical frame to
+            # vote with. A unique, checksum-valid Code128 result returned by
+            # ZXingCPP is sufficient in this mode. Multi-frame camera runs keep
+            # the stricter consensus rules below.
+            if (
+                self.allow_single_frame_result
+                and len(frames) == 1
+                and len(frame_ranked) == 1
+            ):
+                barcode = frame_ranked[0][0]
+                print(
+                    "Barcode accepted from single-image decode: "
+                    f"value={barcode}"
+                )
 
             # --------------------------------------------------
             # 情况 1：
@@ -594,31 +656,18 @@ class AsyncWaybillInspector:
                 error=str(exc),
             )
 
-    def _save_video(self, path: Path, frames: list[np.ndarray]) -> None:
-        if not frames:
-            print("C-camera video was not saved: no frame was captured.")
-            return
-        height, width = frames[0].shape[:2]
-        fps = max(1.0, 1.0 / self.capture_interval_s)
-        writer = cv2.VideoWriter(
-            str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
-        if not writer.isOpened():
-            print(f"C-camera video writer could not be opened: {path}")
-            return
-        try:
-            for frame in frames:
-                if frame.shape[:2] != (height, width):
-                    frame = cv2.resize(frame, (width, height))
-                writer.write(frame)
-        finally:
-            writer.release()
-        print(f"C-camera video saved: {path}")
-
     def _detect_waybills(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         height, width = image.shape[:2]
         detections: list[tuple[float, tuple[int, int, int, int]]] = []
-        for result in self._model(image, conf=self.confidence, verbose=False):
+        # A single offline image cannot recover from a missed detection on a
+        # later frame, so allow a conservative 0.30 fallback there. Production
+        # capture keeps its configured threshold and multi-frame safeguards.
+        detection_confidence = (
+            min(self.confidence, 0.30)
+            if self.allow_single_frame_result
+            else self.confidence
+        )
+        for result in self._model(image, conf=detection_confidence, verbose=False):
             for box in result.boxes:
                 if int(box.cls[0]) != self.waybill_class_id:
                     continue
@@ -990,6 +1039,42 @@ class AsyncWaybillInspector:
             value=(255, 255, 255),
         )
 
+    @staticmethod
+    def _rotate_bound(image: np.ndarray, angle: float) -> np.ndarray:
+        """Rotate without clipping the barcode or its start/stop quiet zones."""
+        if abs(float(angle)) < 1e-6:
+            return image
+
+        height, width = image.shape[:2]
+        center = (width / 2.0, height / 2.0)
+        matrix = cv2.getRotationMatrix2D(center, float(angle), 1.0)
+        cosine = abs(float(matrix[0, 0]))
+        sine = abs(float(matrix[0, 1]))
+        rotated_width = max(1, int(np.ceil(height * sine + width * cosine)))
+        rotated_height = max(1, int(np.ceil(height * cosine + width * sine)))
+        matrix[0, 2] += rotated_width / 2.0 - center[0]
+        matrix[1, 2] += rotated_height / 2.0 - center[1]
+
+        border_value: int | tuple[int, int, int]
+        border_value = 255 if image.ndim == 2 else (255, 255, 255)
+        return cv2.warpAffine(
+            image,
+            matrix,
+            (rotated_width, rotated_height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=border_value,
+        )
+
+    @classmethod
+    def _barcode_rotation_views(
+        cls, image: np.ndarray, angles: tuple[float, ...]
+    ) -> Iterator[tuple[float, np.ndarray]]:
+        """Yield progressively rotated barcode views with a fresh quiet zone."""
+        for angle in angles:
+            rotated = cls._rotate_bound(image, angle)
+            yield angle, cls._add_quiet_zone(rotated)
+
     @classmethod
     def _find_linear_barcode_regions(cls, image: np.ndarray) -> list[np.ndarray]:
         """Locate dense vertical-line groups and return deskewed barcode crops."""
@@ -1052,6 +1137,91 @@ class AsyncWaybillInspector:
             regions.append((area, cls._add_quiet_zone(crop)))
         regions.sort(key=lambda item: item[0], reverse=True)
         return [region for _area, region in regions[:8]]
+
+    def _find_barcode_obb_regions(
+        self, image: np.ndarray
+    ) -> list[tuple[float, str, np.ndarray]]:
+        """Detect barcode OBBs and rectify each quadrilateral for ZXingCPP."""
+        if self._barcode_model is None:
+            return []
+
+        detected: list[tuple[float, str, np.ndarray]] = []
+        result = self._barcode_model.predict(
+            image,
+            conf=self.barcode_confidence,
+            verbose=False,
+        )[0]
+        obb = getattr(result, "obb", None)
+        if obb is None or len(obb) == 0:
+            return []
+
+        height, width = image.shape[:2]
+        polygons = obb.xyxyxyxy.cpu().numpy()
+        confidences = obb.conf.cpu().numpy()
+        class_ids = obb.cls.cpu().numpy().astype(int)
+        for polygon, confidence, class_id in zip(
+            polygons, confidences, class_ids, strict=True
+        ):
+            if int(class_id) != self.barcode_class_id:
+                continue
+            ordered = self._order_quad(
+                np.asarray(polygon, dtype=np.float32).reshape(4, 2)
+            )
+            top_left, top_right, _bottom_right, bottom_left = ordered
+            horizontal_axis = top_right - top_left
+            vertical_axis = bottom_left - top_left
+            horizontal_length = float(np.linalg.norm(horizontal_axis))
+            vertical_length = float(np.linalg.norm(vertical_axis))
+            if horizontal_length < 1e-6 or vertical_length < 1e-6:
+                continue
+            horizontal_axis /= horizontal_length
+            vertical_axis /= vertical_length
+            center = ordered.mean(axis=0)
+
+            # Each value is padding per side. Generate a tight, medium and wide
+            # view: generous along the barcode's long axis for Code128 quiet
+            # zones, conservative along the short axis to exclude nearby text.
+            padding_profiles = (
+                ("long10_short05", 0.10, 0.05),
+                ("long20_short08", 0.20, 0.08),
+                ("long30_short10", 0.30, 0.10),
+            )
+            long_is_horizontal = horizontal_length >= vertical_length
+            for profile_name, long_padding, short_padding in padding_profiles:
+                horizontal_scale = 1.0 + 2.0 * (
+                    long_padding if long_is_horizontal else short_padding
+                )
+                vertical_scale = 1.0 + 2.0 * (
+                    short_padding if long_is_horizontal else long_padding
+                )
+                expanded: list[np.ndarray] = []
+                for point in ordered:
+                    offset = point - center
+                    horizontal_component = float(offset @ horizontal_axis)
+                    vertical_component = float(offset @ vertical_axis)
+                    expanded.append(
+                        center
+                        + horizontal_axis
+                        * horizontal_component
+                        * horizontal_scale
+                        + vertical_axis * vertical_component * vertical_scale
+                    )
+                expanded_points = np.asarray(expanded, dtype=np.float32)
+                expanded_points[:, 0] = np.clip(
+                    expanded_points[:, 0], 0, width - 1
+                )
+                expanded_points[:, 1] = np.clip(
+                    expanded_points[:, 1], 0, height - 1
+                )
+                crop = self._four_point_transform(image, expanded_points)
+                if crop.size == 0 or min(crop.shape[:2]) < 8:
+                    continue
+                if crop.shape[0] > crop.shape[1]:
+                    crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+                detected.append((float(confidence), profile_name, crop))
+
+        detected.sort(key=lambda item: item[0], reverse=True)
+        return detected
 
     @staticmethod
     def _normalize_barcode_text(value: object) -> str | None:
@@ -1174,7 +1344,14 @@ class AsyncWaybillInspector:
         # 不使用 OpenCV 进行最终解码。
         # --------------------------------------------------
 
-        regions = self._find_linear_barcode_regions(rectified)
+        obb_regions = self._find_barcode_obb_regions(image)
+        located_regions = self._find_linear_barcode_regions(rectified)
+        if self._barcode_model is not None:
+            print(
+                "Barcode OBB detection: "
+                f"regions={len(obb_regions)} "
+                f"confidences={[round(item[0], 3) for item in obb_regions]}"
+            )
 
         # --------------------------------------------------
         # 第二阶段：
@@ -1184,17 +1361,58 @@ class AsyncWaybillInspector:
         # 同时加入旋转 90° 的版本。
         # --------------------------------------------------
 
-        regions.extend(
-            [
-                self._add_quiet_zone(rectified),
-                self._add_quiet_zone(
-                    cv2.rotate(
-                        rectified,
-                        cv2.ROTATE_90_CLOCKWISE,
-                    )
-                ),
-            ]
+        # Localized crops have already been deskewed with minAreaRect. Search a
+        # small neighbourhood to compensate for imperfect contours, motion blur
+        # and interpolation. Only if those fail do we rotate the whole waybill
+        # through a wider range as a slower fallback.
+        local_angles = (0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0, -8.0, 8.0)
+        obb_angles = (0.0, -2.0, 2.0, -4.0, 4.0)
+        # Whole-waybill fallbacks cover arbitrary package orientation. Put the
+        # most common camera angles first so successful reads still exit early.
+        fallback_angles = (
+            0.0,
+            -15.0,
+            15.0,
+            -45.0,
+            45.0,
+            -90.0,
+            90.0,
+            -135.0,
+            135.0,
+            180.0,
+            -30.0,
+            30.0,
+            -60.0,
+            60.0,
+            -75.0,
+            75.0,
+            -105.0,
+            105.0,
+            -120.0,
+            120.0,
+            -150.0,
+            150.0,
+            -165.0,
+            165.0,
         )
+        search_regions: list[tuple[str, float, np.ndarray]] = []
+        # Try every OBB/padding profile at its native rectified angle first,
+        # then progressively add only small residual corrections.
+        for angle in obb_angles:
+            for region_index, (_confidence, profile_name, region) in enumerate(
+                obb_regions
+            ):
+                rotated = self._add_quiet_zone(self._rotate_bound(region, angle))
+                search_regions.append(
+                    (f"obb_{region_index}_{profile_name}", angle, rotated)
+                )
+        for region_index, region in enumerate(located_regions):
+            for angle, rotated in self._barcode_rotation_views(region, local_angles):
+                search_regions.append((f"localized_{region_index}", angle, rotated))
+        for angle, rotated in self._barcode_rotation_views(
+            rectified, fallback_angles
+        ):
+            search_regions.append(("full_waybill", angle, rotated))
 
         # 当前业务读取一维条形码
         formats = self._zxingcpp.BarcodeFormat.Code128
@@ -1207,7 +1425,7 @@ class AsyncWaybillInspector:
         # 一旦识别成功，后面的增强不会继续计算。
         # --------------------------------------------------
 
-        for region_index, region in enumerate(regions):
+        for region_index, (region_source, angle, region) in enumerate(search_regions):
 
             for enhance_index, candidate in enumerate(self._enhance_images(region)):
 
@@ -1223,7 +1441,8 @@ class AsyncWaybillInspector:
                 except Exception as exc:
                     print(
                         f"ZXingCPP decode failed "
-                        f"region={region_index} "
+                        f"region={region_index} source={region_source} "
+                        f"angle={angle:+.1f} "
                         f"enhance={enhance_index}: {exc}"
                     )
                     continue
@@ -1236,13 +1455,54 @@ class AsyncWaybillInspector:
                     if text:
                         codes.add(text)
 
+                pure_binarizer_name: str | None = None
+                if (
+                    not codes
+                    and region_source.startswith("obb_")
+                    and enhance_index <= 5
+                ):
+                    pure_binarizers = (
+                        ("LocalAverage", self._zxingcpp.Binarizer.LocalAverage),
+                        (
+                            "GlobalHistogram",
+                            self._zxingcpp.Binarizer.GlobalHistogram,
+                        ),
+                        (
+                            "FixedThreshold",
+                            self._zxingcpp.Binarizer.FixedThreshold,
+                        ),
+                        ("BoolCast", self._zxingcpp.Binarizer.BoolCast),
+                    )
+                    for binarizer_name, binarizer in pure_binarizers:
+                        try:
+                            pure_results = self._zxingcpp.read_barcodes(
+                                candidate,
+                                formats=formats,
+                                try_rotate=False,
+                                try_downscale=False,
+                                try_invert=True,
+                                binarizer=binarizer,
+                                is_pure=True,
+                            )
+                        except Exception:
+                            continue
+                        for result in pure_results:
+                            text = self._normalize_barcode_text(result.text)
+                            if text:
+                                codes.add(text)
+                        if codes:
+                            pure_binarizer_name = binarizer_name
+                            break
+
                 if codes:
                     decoded = sorted(codes)
 
                     print(
                         f"Barcode decoded by ZXingCPP: "
-                        f"region={region_index} "
+                        f"region={region_index} source={region_source} "
+                        f"angle={angle:+.1f} "
                         f"enhance={enhance_index} "
+                        f"pure_binarizer={pure_binarizer_name or 'none'} "
                         f"value={decoded}"
                     )
 

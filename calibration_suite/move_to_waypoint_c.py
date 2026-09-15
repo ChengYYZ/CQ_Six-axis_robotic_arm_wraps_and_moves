@@ -6,8 +6,7 @@ TCP_XYZ_MM = (-125.370, 87.591, 279.781)
 TCP_RPY_DEG = (178.740, -32.430, -87.920)
 
 # The same waypoint C used by surface_cluster_grasp.py.
-# WAYPOINT_C = (916.271, 119.481, 326.308, -1.990, 5.492, -3.082)
-WAYPOINT_C = (452.368, 808.428, 284.504, -3.030, 0.839, 79.567)
+WAYPOINT_C = (778.995, 366.266, 515.047, -0.422, 1.598, -2.162)
 
 def main() -> None:
     print(

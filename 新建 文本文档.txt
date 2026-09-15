@@ -5,3 +5,8 @@
 $env:HIKVISION_PASSWORD="mopai111"
 移动到C点
 .\.venv\Scripts\python.exe .\calibration_suite\move_to_waypoint_c.py
+单图片条形码识别
+.\run_offline_waybill_test.cmd "D:\你的图片目录" --conf 0.35
+前端
+.\run_system_desktop.cmd
+
