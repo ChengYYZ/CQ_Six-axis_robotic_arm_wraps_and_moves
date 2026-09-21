@@ -2,7 +2,6 @@
 .\run_surface_cluster_grasp.cmd
 .\run_surface_cluster_grasp_waybill.cmd
 .\run_surface_cluster_grasp_waybill.cmd --acknowledge-verified-tcp
-$env:HIKVISION_PASSWORD="mopai111"
 移动到C点
 .\.venv\Scripts\python.exe .\calibration_suite\move_to_waypoint_c.py
 单图片条形码识别
