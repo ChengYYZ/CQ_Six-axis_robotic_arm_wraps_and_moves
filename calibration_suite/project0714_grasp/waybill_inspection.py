@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -28,6 +28,8 @@ class WaybillInspectionResult:
     elapsed_s: float
     error: str | None = None
     detection_to_barcode_s: float | None = None
+    inspection_id: str | None = None
+    view_name: str = "single"
 
 
 class AsyncWaybillInspector:
@@ -52,7 +54,9 @@ class AsyncWaybillInspector:
         waybill_class_id: int = 0,
         barcode_class_id: int = 0,
         allow_single_frame_result: bool = False,
+        fast_single_frame_barcode: bool = False,
         result_callback: Callable[[WaybillInspectionResult], None] | None = None,
+        preview_path: str | Path | None = None,
     ) -> None:
         if not password:
             raise ValueError("Hikvision password is empty.")
@@ -84,8 +88,12 @@ class AsyncWaybillInspector:
         self.waybill_class_id = int(waybill_class_id)
         self.barcode_class_id = int(barcode_class_id)
         self.allow_single_frame_result = bool(allow_single_frame_result)
+        self.fast_single_frame_barcode = bool(fast_single_frame_barcode)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_path = Path(preview_path) if preview_path is not None else None
+        if self.preview_path is not None:
+            self.preview_path.parent.mkdir(parents=True, exist_ok=True)
         self._zxingcpp = zxingcpp
         self._model = YOLO(str(model_path))
         self._barcode_model = (
@@ -106,11 +114,20 @@ class AsyncWaybillInspector:
         self._capture_thread: Thread | None = None
         self._capture_generation = 0
         self._active_candidate: int | None = None
+        self._active_inspection_id: str | None = None
+        self._active_view_name = "single"
         self._c_arrival_time: float | None = None
         self._futures: dict[int, Future[WaybillInspectionResult]] = {}
+        self._view_results: dict[str, dict[str, WaybillInspectionResult]] = {}
 
-    def begin_capture(self, candidate_index: int) -> None:
-        """Capture a fixed-duration clip and submit it automatically for inspection."""
+    def begin_capture(
+        self,
+        candidate_index: int,
+        *,
+        inspection_id: str | None = None,
+        view_name: str = "single",
+    ) -> None:
+        """Start buffering a clip; the motion thread freezes it explicitly at C."""
         self.cancel_capture()
         with self._lock:
             # A second C-point view for the same parcel must not return the
@@ -119,6 +136,8 @@ class AsyncWaybillInspector:
             self._capture_generation += 1
             generation = self._capture_generation
             self._active_candidate = int(candidate_index)
+            self._active_inspection_id = inspection_id
+            self._active_view_name = str(view_name)
             self._c_arrival_time = None
             self._frames.clear()
             self._capture_stop = Event()
@@ -143,11 +162,20 @@ class AsyncWaybillInspector:
         with self._lock:
             self._capture_stop.set()
             self._active_candidate = None
+            inspection_id = self._active_inspection_id
+            view_name = self._active_view_name
+            self._active_inspection_id = None
+            self._active_view_name = "single"
             self._c_arrival_time = None
             frames = [image.copy() for _timestamp, image in self._frames]
             self._frames.clear()
 
-        return self._submit_frames(int(candidate_index), frames)
+        return self._submit_frames(
+            int(candidate_index),
+            frames,
+            inspection_id=inspection_id,
+            view_name=view_name,
+        )
 
     def wait_for_result(
         self,
@@ -179,6 +207,8 @@ class AsyncWaybillInspector:
         with self._lock:
             self._capture_stop.set()
             self._active_candidate = None
+            self._active_inspection_id = None
+            self._active_view_name = "single"
             self._c_arrival_time = None
             self._frames.clear()
 
@@ -234,6 +264,7 @@ class AsyncWaybillInspector:
                     )
                 continue
             camera_prewarmed = True
+            self._publish_preview(image)
             with self._lock:
                 if (
                     generation != self._capture_generation
@@ -253,30 +284,107 @@ class AsyncWaybillInspector:
                 ):
                     self._frames.append((captured_at, image))
 
-        if not stop_event.is_set():
-            with self._lock:
-                if (
-                    generation != self._capture_generation
-                    or self._active_candidate is None
-                ):
-                    return
-                candidate_index = self._active_candidate
-                self._active_candidate = None
-                self._c_arrival_time = None
-                frames = [image.copy() for _timestamp, image in self._frames]
-                self._frames.clear()
-            self._submit_frames(candidate_index, frames)
+    def _publish_preview(self, image: np.ndarray) -> None:
+        """Atomically publish the latest captured Hikvision frame for the desktop UI."""
+        if self.preview_path is None:
+            return
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return
+        temporary = self.preview_path.with_name(f"{self.preview_path.name}.tmp")
+        temporary.write_bytes(encoded.tobytes())
+        for attempt in range(5):
+            try:
+                os.replace(temporary, self.preview_path)
+                return
+            except PermissionError:
+                if attempt < 4:
+                    time.sleep(0.01 * (attempt + 1))
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _submit_frames(
-        self, candidate_index: int, frames: list[np.ndarray]
+        self,
+        candidate_index: int,
+        frames: list[np.ndarray],
+        *,
+        inspection_id: str | None = None,
+        view_name: str = "single",
     ) -> Future[WaybillInspectionResult]:
         future = self._executor.submit(
-            self._inspect_frames, int(candidate_index), frames
+            self._inspect_tagged_frames,
+            int(candidate_index),
+            frames,
+            inspection_id,
+            str(view_name),
         )
         with self._lock:
             self._futures[int(candidate_index)] = future
         future.add_done_callback(self._handle_future)
         return future
+
+    def _inspect_tagged_frames(
+        self,
+        candidate_index: int,
+        frames: list[np.ndarray],
+        inspection_id: str | None,
+        view_name: str,
+    ) -> WaybillInspectionResult:
+        result = self._inspect_frames(candidate_index, frames)
+        return replace(
+            result,
+            inspection_id=inspection_id,
+            view_name=view_name,
+        )
+
+    def _save_and_extract_video(
+        self, run_dir: Path, frames: list[np.ndarray], max_frames: int = 6
+    ) -> list[np.ndarray]:
+        """Persist the camera clip, then extract evenly spaced frames for recognition."""
+        valid = [frame for frame in frames if frame is not None and frame.size]
+        if not valid:
+            return []
+        height, width = valid[0].shape[:2]
+        video_path = run_dir / "capture.mp4"
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(1.0, 1.0 / self.capture_interval_s),
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not create waybill video: {video_path}")
+        try:
+            for frame in valid:
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+                writer.write(frame)
+        finally:
+            writer.release()
+
+        capture = cv2.VideoCapture(str(video_path))
+        extracted: list[np.ndarray] = []
+        try:
+            total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+            wanted = min(max_frames, total)
+            indices = set(np.linspace(0, total - 1, wanted, dtype=int).tolist())
+            index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if index in indices:
+                    extracted.append(frame)
+                index += 1
+        finally:
+            capture.release()
+        print(
+            f"Saved waybill video {video_path.name}: source_frames={len(valid)}, "
+            f"extracted_frames={len(extracted)}."
+        )
+        return extracted
 
     def _capture_snapshot(
         self, session: requests.Session, auth: HTTPDigestAuth
@@ -323,6 +431,17 @@ class AsyncWaybillInspector:
             / f"candidate_{candidate_index}_{datetime.now():%Y%m%d_%H%M%S_%f}"
         )
         run_dir.mkdir(parents=True, exist_ok=True)
+        frames = self._save_and_extract_video(run_dir, frames)
+        if not frames:
+            return WaybillInspectionResult(
+                candidate_index=candidate_index,
+                has_waybill=False,
+                barcode=None,
+                frame_count=0,
+                waybill_frame_count=0,
+                elapsed_s=time.monotonic() - started,
+                error="No frame could be extracted from the saved camera video.",
+            )
         full_frame_sharpness: list[float] = []
         for frame in frames:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -402,8 +521,37 @@ class AsyncWaybillInspector:
             # Each physical frame contributes at most one vote per decoded
             # value. This prevents the many preprocessing variants of one
             # blurry frame from overwhelming agreement across real frames.
-            for _sharpness, frame_index, box_index, roi in selected_rois:
-                codes = self._read_barcodes(roi)
+            if selected_rois:
+                # selected_rois is already ordered by sharpness. In fast mode,
+                # decode the two clearest physical frames rather than the two
+                # earliest frames.
+                decode_rois = selected_rois[:2] if self.fast_single_frame_barcode else selected_rois
+            elif self.fast_single_frame_barcode:
+                # A missed waybill box must not suppress barcode recognition.
+                # The barcode reader performs its own OBB search, so use only
+                # the sharpest complete frame as a bounded online fallback.
+                sharpest_full_frames = sorted(
+                    enumerate(frames),
+                    key=lambda item: full_frame_sharpness[item[0]],
+                    reverse=True,
+                )[:1]
+                decode_rois = [
+                    (full_frame_sharpness[index], index, -1, frame)
+                    for index, frame in sharpest_full_frames
+                ]
+                print(
+                    f"No waybill ROI detected for candidate #{candidate_index}; "
+                    f"trying full-frame barcode fallback on {len(decode_rois)} "
+                    "sharpest physical frame(s)."
+                )
+            else:
+                decode_rois = selected_rois
+            for _sharpness, frame_index, box_index, roi in decode_rois:
+                codes = (
+                    self._read_barcodes_fast_full_frame(roi)
+                    if box_index < 0
+                    else self._read_barcodes(roi)
+                )
 
                 # 同一个物理帧对同一个值最多贡献一票
                 frame_votes.update(set(codes))
@@ -413,6 +561,45 @@ class AsyncWaybillInspector:
                         f"Barcode candidates frame={frame_index} "
                         f"roi={box_index}: {codes}"
                     )
+                    if self.fast_single_frame_barcode and len(set(codes)) == 1:
+                        barcode = codes[0]
+                        detection_to_barcode_s = (
+                            time.monotonic() - first_waybill_detected_at
+                            if first_waybill_detected_at is not None
+                            else None
+                        )
+                        print(
+                            "Barcode accepted immediately from a checksum-valid physical frame: "
+                            f"value={barcode}, frame={frame_index}"
+                        )
+                        if detection_to_barcode_s is not None:
+                            print(
+                                f"Waybill detection-to-barcode candidate #{candidate_index}: "
+                                f"{detection_to_barcode_s:.3f}s"
+                            )
+                        return WaybillInspectionResult(
+                            candidate_index=candidate_index,
+                            has_waybill=True,
+                            barcode=barcode,
+                            frame_count=len(frames),
+                            waybill_frame_count=waybill_frame_count,
+                            elapsed_s=time.monotonic() - started,
+                            detection_to_barcode_s=detection_to_barcode_s,
+                        )
+            if self.fast_single_frame_barcode:
+                print(
+                    f"Barcode fast path decoded {len(decode_rois)} selected physical frame(s) "
+                    f"from {len(frames)} extracted frame(s) without a result; "
+                    "skipping temporal fusion for the online demo."
+                )
+                return WaybillInspectionResult(
+                    candidate_index=candidate_index,
+                    has_waybill=waybill_frame_count >= 2,
+                    barcode=None,
+                    frame_count=len(frames),
+                    waybill_frame_count=waybill_frame_count,
+                    elapsed_s=time.monotonic() - started,
+                )
             # if codes:
             #     print(
             #         f"Barcode candidates frame={frame_index} roi={box_index}: {codes}"
@@ -1332,6 +1519,58 @@ class AsyncWaybillInspector:
     #                 return sorted(codes)
 
     #     return []
+    def _read_barcodes_fast_full_frame(self, image: np.ndarray) -> list[str]:
+        """Bounded online fallback: one OBB pass and limited native-angle decoding."""
+        obb_regions = self._find_barcode_obb_regions(image)
+        print(
+            "Barcode OBB detection: "
+            f"regions={len(obb_regions)} "
+            f"confidences={[round(item[0], 3) for item in obb_regions]}"
+        )
+        if not obb_regions:
+            return []
+
+        formats = self._zxingcpp.BarcodeFormat.Code128
+        # One detected barcode produces three padding profiles. Try only those
+        # highest-confidence native-angle crops and two cheap image variants.
+        for region_index, (_confidence, profile_name, region) in enumerate(
+            obb_regions[:3]
+        ):
+            prepared = self._add_quiet_zone(region)
+            for enhance_index, candidate in enumerate(self._enhance_images(prepared)):
+                if enhance_index >= 2:
+                    break
+                try:
+                    results = self._zxingcpp.read_barcodes(
+                        candidate,
+                        formats=formats,
+                        try_rotate=True,
+                        try_downscale=False,
+                        try_invert=True,
+                    )
+                except Exception as exc:
+                    print(
+                        "ZXingCPP fast full-frame decode failed "
+                        f"region={region_index} profile={profile_name} "
+                        f"enhance={enhance_index}: {exc}"
+                    )
+                    continue
+                codes = sorted(
+                    {
+                        text
+                        for result in results
+                        if (text := self._normalize_barcode_text(result.text)) is not None
+                    }
+                )
+                if codes:
+                    print(
+                        "Barcode decoded by bounded full-frame fallback: "
+                        f"region={region_index} profile={profile_name} "
+                        f"enhance={enhance_index} value={codes}"
+                    )
+                    return codes
+        return []
+
     def _read_barcodes(self, image: np.ndarray) -> list[str]:
         rectified = self._rectify_waybill(image)
 
@@ -1523,11 +1762,37 @@ class AsyncWaybillInspector:
             return
         self._append_result(result)
         self._result_callback(result)
+        self._record_view_result(result)
+
+    def _record_view_result(self, result: WaybillInspectionResult) -> None:
+        inspection_id = result.inspection_id
+        if inspection_id is None or result.view_name not in {"main", "side"}:
+            return
+        with self._lock:
+            views = self._view_results.setdefault(inspection_id, {})
+            views[result.view_name] = result
+            if not {"main", "side"}.issubset(views):
+                return
+            completed = self._view_results.pop(inspection_id)
+        main = completed["main"]
+        side = completed["side"]
+        barcode = main.barcode or side.barcode
+        has_waybill = main.has_waybill or side.has_waybill or barcode is not None
+        errors = [item.error for item in (main, side) if item.error]
+        print(
+            f"Waybill inspection package {inspection_id} combined: "
+            f"main={'barcode' if main.barcode else 'waybill' if main.has_waybill else 'none'}, "
+            f"side={'barcode' if side.barcode else 'waybill' if side.has_waybill else 'none'}, "
+            f"final={'barcode=' + barcode if barcode else 'waybill-unreadable' if has_waybill else 'no-detection'}, "
+            f"errors={errors or 'none'}."
+        )
 
     def _append_result(self, result: WaybillInspectionResult) -> None:
         payload = {
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "candidate_index": result.candidate_index,
+            "inspection_id": result.inspection_id,
+            "view_name": result.view_name,
             "has_waybill": result.has_waybill,
             "barcode": result.barcode,
             "frame_count": result.frame_count,
@@ -1545,7 +1810,8 @@ class AsyncWaybillInspector:
 
     @staticmethod
     def _print_result(result: WaybillInspectionResult) -> None:
-        prefix = f"Waybill inspection candidate #{result.candidate_index}"
+        identity = result.inspection_id or f"candidate-{result.candidate_index}"
+        prefix = f"Waybill inspection {identity} view={result.view_name}"
         if result.error:
             print(f"{prefix}: ERROR {result.error}")
         elif not result.has_waybill:

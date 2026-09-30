@@ -15,6 +15,15 @@ from typing import Any
 
 from PIL import Image, ImageTk
 
+try:
+    from calibration_suite.huaray_reader import HuarayPreviewPublisher
+    from calibration_suite.hikvision_preview import HikvisionPreviewPublisher
+except ModuleNotFoundError:
+    # run_system_desktop.cmd executes this file directly, making this directory
+    # (rather than the repository root) the first import location.
+    from huaray_reader import HuarayPreviewPublisher
+    from hikvision_preview import HikvisionPreviewPublisher
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAIN_SCRIPT = PROJECT_ROOT / "calibration_suite" / "surface_cluster_grasp.py"
@@ -22,10 +31,79 @@ OFFLINE_GUI = PROJECT_ROOT / "calibration_suite" / "waybill_desktop.py"
 DEFAULT_DEBUG_IMAGE = (
     PROJECT_ROOT / "calibration_suite" / "workspace" / "surface_grasp" / "debug_masks.png"
 )
-DEFAULT_WAYBILL_OUTPUT = (
-    PROJECT_ROOT / "calibration_suite" / "workspace" / "waybill_inspection"
-)
 DEFAULT_GUI_FRAME_DIR = PROJECT_ROOT / "calibration_suite" / "workspace" / "system_gui_frames"
+NO_BARCODE_TEXT = "暂未识别出条形码"
+BARCODE_CYCLE_RESET_PREFIX = "Suction command ON ->"
+DEFAULT_MAIN_OPTIONS: tuple[str, ...] = ()
+
+
+def barcode_from_log_line(line: str) -> tuple[str, str] | None:
+    """Return only an explicitly labelled barcode event from a main-process log line."""
+    tcp_match = re.search(r"Top/front barcode received:\s*([^\r\n]+)$", line)
+    if tcp_match:
+        barcode = tcp_match.group(1).strip()
+        return ("D点TCP条码", barcode) if barcode else None
+
+    result_match = re.search(
+        r"(?:final=|detected,\s*)barcode=([^\s,)]+)",
+        line,
+        re.IGNORECASE,
+    )
+    if result_match:
+        barcode = result_match.group(1).strip()
+        if barcode and barcode.lower() not in {"none", "null", "--"}:
+            return "条码", barcode
+    return None
+
+
+def resets_barcode_display(line: str) -> bool:
+    """Return whether suction really started a new package pickup cycle."""
+    return line.startswith(BARCODE_CYCLE_RESET_PREFIX)
+
+
+def _barcode_from_items(barcodes: object) -> str | None:
+    if not isinstance(barcodes, list):
+        return None
+    for item in barcodes:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        if code:
+            return code
+    return None
+
+
+def barcode_event_from_huaray_payload(payload: object) -> tuple[int | None, str] | None:
+    """Extract a durable SDK detection event, falling back to legacy live frames."""
+    if not isinstance(payload, dict):
+        return None
+    last_detection = payload.get("last_detection")
+    if isinstance(last_detection, dict):
+        code = _barcode_from_items(last_detection.get("barcodes"))
+        try:
+            sequence = int(last_detection.get("sequence"))
+        except (TypeError, ValueError):
+            sequence = None
+        if code:
+            return sequence, code
+    code = _barcode_from_items(payload.get("barcodes"))
+    return (None, code) if code else None
+
+
+def barcode_from_huaray_payload(payload: object) -> str | None:
+    """Extract the first non-empty SDK barcode from a preview status payload."""
+    event = barcode_event_from_huaray_payload(payload)
+    return event[1] if event is not None else None
+
+
+def huaray_detection_sequence(payload: object) -> int:
+    """Return the durable detection sequence, or zero for a legacy payload."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("last_detection"), dict):
+        return 0
+    try:
+        return max(0, int(payload["last_detection"].get("sequence", 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 class SystemDesktopApp:
@@ -41,8 +119,21 @@ class SystemDesktopApp:
         self.log_lines: list[str] = []
         self.color_photo: ImageTk.PhotoImage | None = None
         self.depth_photo: ImageTk.PhotoImage | None = None
-        self.frame_mtimes = {"color.jpg": 0.0, "depth.jpg": 0.0}
-        self.last_waybill_mtime = 0.0
+        self.hikvision_photo: ImageTk.PhotoImage | None = None
+        self.huaray_photo: ImageTk.PhotoImage | None = None
+        self.frame_mtimes = {
+            "color.jpg": 0.0,
+            "depth.jpg": 0.0,
+            "hikvision.jpg": 0.0,
+            "huaray.jpg": 0.0,
+        }
+        self.frame_images: dict[str, Image.Image] = {}
+        self.frame_render_sizes: dict[str, tuple[int, int]] = {}
+        self.last_huaray_mtime = 0.0
+        self.last_huaray_detection_sequence = 0
+        self.huaray_barcode_window_open = False
+        self.last_huaray_displayed_code: str | None = None
+        self.hikvision_preview: HikvisionPreviewPublisher | None = None
 
         self.mode_var = tk.StringVar(value="安全演练")
         self.system_var = tk.StringVar(value="未启动")
@@ -51,13 +142,14 @@ class SystemDesktopApp:
         self.analysis_var = tk.StringVar(value="等待")
         self.motion_var = tk.StringVar(value="停止")
         self.package_var = tk.StringVar(value="0")
-        self.barcode_var = tk.StringVar(value="--")
+        self.barcode_var = tk.StringVar(value=NO_BARCODE_TEXT)
         self.last_event_var = tk.StringVar(value="等待启动")
 
         self.robot_ip_var = tk.StringVar(value="192.168.2.160")
         self.hik_ip_var = tk.StringVar(value="192.168.2.14")
         self.hik_user_var = tk.StringVar(value="admin")
         self.hik_password_var = tk.StringVar(value=os.environ.get("HIKVISION_PASSWORD", ""))
+        self.huaray_ip_var = tk.StringVar(value="192.168.2.200")
         self.package_model_var = tk.StringVar(
             value=str(
                 PROJECT_ROOT
@@ -72,10 +164,11 @@ class SystemDesktopApp:
         self.barcode_model_var = tk.StringVar(
             value=str(PROJECT_ROOT / "weights" / "barcode_weights" / "best.pt")
         )
-        self.yolo_conf_var = tk.StringVar(value="0.35")
+        self.yolo_conf_var = tk.StringVar(value="0.5")
         self.waybill_conf_var = tk.StringVar(value="0.50")
         self.barcode_conf_var = tk.StringVar(value="0.25")
         self.speed_var = tk.StringVar(value="400")
+        self.d_rotation_speed_var = tk.StringVar(value="80")
         self.standoff_var = tk.StringVar(value="100")
         self.pickup_down_var = tk.StringVar(value="110")
         self.primary_port_var = tk.StringVar(value="6")
@@ -87,8 +180,19 @@ class SystemDesktopApp:
 
         self._configure_style()
         self._build_ui()
+        self.huaray_preview = HuarayPreviewPublisher(
+            DEFAULT_GUI_FRAME_DIR / "huaray.jpg",
+            status_path=DEFAULT_GUI_FRAME_DIR / "huaray.json",
+            device_ip=self.huaray_ip_var.get(),
+            status_callback=lambda state, detail: self.events.put(
+                ("huaray_status", (state, detail))
+            ),
+        )
+        self.huaray_preview.start()
+        if self.hik_password_var.get():
+            self._restart_hikvision_preview(show_error=False)
         self.root.after(100, self._poll_events)
-        self.root.after(1000, self._refresh_artifacts)
+        self.root.after(200, self._refresh_artifacts)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_style(self) -> None:
@@ -161,21 +265,47 @@ class SystemDesktopApp:
         content.add(visual, weight=3)
         content.add(activity, weight=2)
 
-        preview_row = ttk.Frame(visual)
-        preview_row.pack(fill="both", expand=True)
-        color_box = ttk.LabelFrame(preview_row, text="顶部RGB / 包裹检测", padding=5)
-        depth_box = ttk.LabelFrame(preview_row, text="深度 / 抓取候选", padding=5)
-        color_box.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        depth_box.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        preview_grid = ttk.Frame(visual)
+        preview_grid.pack(fill="both", expand=True)
+        for column in (0, 1):
+            preview_grid.columnconfigure(column, weight=1, uniform="preview")
+        for row in (0, 1):
+            preview_grid.rowconfigure(row, weight=1, uniform="preview")
+        color_box = ttk.LabelFrame(preview_grid, text="顶部RGB / 包裹检测", padding=5)
+        depth_box = ttk.LabelFrame(preview_grid, text="深度 / 抓取候选", padding=5)
+        hikvision_box = ttk.LabelFrame(preview_grid, text="C点海康相机 / 面单", padding=5)
+        huaray_box = ttk.LabelFrame(preview_grid, text="D点华睿读码器 / 条码", padding=5)
+        color_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
+        depth_box.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        hikvision_box.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(4, 0))
+        huaray_box.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
         self.color_label = ttk.Label(color_box, text="等待相机画面", anchor="center")
         self.depth_label = ttk.Label(depth_box, text="等待深度画面", anchor="center")
+        self.hikvision_label = ttk.Label(
+            hikvision_box,
+            text="等待海康相机采集\n（面单识别期间刷新）",
+            anchor="center",
+            justify="center",
+        )
+        self.huaray_label = ttk.Label(
+            huaray_box,
+            text="正在连接华睿读码器\n192.168.2.200",
+            anchor="center",
+            justify="center",
+        )
         self.color_label.pack(fill="both", expand=True)
         self.depth_label.pack(fill="both", expand=True)
+        self.hikvision_label.pack(fill="both", expand=True)
+        self.huaray_label.pack(fill="both", expand=True)
 
         barcode_box = ttk.LabelFrame(visual, text="最新物流条码", padding=10)
         barcode_box.pack(fill="x", pady=(8, 0))
-        ttk.Label(barcode_box, textvariable=self.barcode_var, style="Barcode.TLabel").pack(side="left")
-        ttk.Label(barcode_box, textvariable=self.last_event_var).pack(side="right", padx=8)
+        ttk.Label(
+            barcode_box,
+            textvariable=self.barcode_var,
+            style="Barcode.TLabel",
+            anchor="w",
+        ).pack(fill="x")
 
         event_box = ttk.LabelFrame(activity, text="关键事件", padding=5)
         event_box.pack(fill="both", expand=True)
@@ -190,6 +320,16 @@ class SystemDesktopApp:
         self.event_tree.configure(yscrollcommand=scroll.set)
         self.event_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+        status_box = ttk.LabelFrame(activity, text="最新状态", padding=6)
+        status_box.pack(fill="x", pady=(8, 0))
+        ttk.Label(
+            status_box,
+            textvariable=self.last_event_var,
+            anchor="w",
+            justify="left",
+            wraplength=500,
+        ).pack(fill="x")
 
         ttk.Label(
             activity,
@@ -218,19 +358,26 @@ class SystemDesktopApp:
         self._entry(device, 1, "海康相机IP", self.hik_ip_var)
         self._entry(device, 2, "海康用户名", self.hik_user_var)
         self._entry(device, 3, "海康密码", self.hik_password_var, show="●")
-        self._path_entry(device, 4, "包裹YOLO模型", self.package_model_var)
-        self._path_entry(device, 5, "面单Detect模型", self.waybill_model_var)
-        self._path_entry(device, 6, "条码OBB模型", self.barcode_model_var)
+        ttk.Button(
+            device,
+            text="连接实时预览",
+            command=self._restart_hikvision_preview,
+        ).grid(row=3, column=2, padx=4)
+        self._entry(device, 4, "D点华睿读码器IP", self.huaray_ip_var)
+        self._path_entry(device, 5, "包裹YOLO模型", self.package_model_var)
+        self._path_entry(device, 6, "面单Detect模型", self.waybill_model_var)
+        self._path_entry(device, 7, "条码OBB模型", self.barcode_model_var)
 
         self._entry(motion, 0, "机械臂速度 mm/s", self.speed_var)
-        self._entry(motion, 1, "安全悬停距离 mm", self.standoff_var)
-        self._entry(motion, 2, "下降距离 mm", self.pickup_down_var)
-        self._entry(motion, 3, "主吸盘DO端口", self.primary_port_var)
-        self._entry(motion, 4, "副吸盘DO端口", self.secondary_port_var)
-        self._entry(motion, 5, "包裹YOLO阈值", self.yolo_conf_var)
-        self._entry(motion, 6, "面单阈值", self.waybill_conf_var)
-        self._entry(motion, 7, "条码OBB阈值", self.barcode_conf_var)
-        self._entry(motion, 8, "附加命令行参数", self.extra_args_var)
+        self._entry(motion, 1, "D安全点旋转速度 mm/s", self.d_rotation_speed_var)
+        self._entry(motion, 2, "安全悬停距离 mm", self.standoff_var)
+        self._entry(motion, 3, "下降距离 mm", self.pickup_down_var)
+        self._entry(motion, 4, "主吸盘DO端口", self.primary_port_var)
+        self._entry(motion, 5, "副吸盘DO端口", self.secondary_port_var)
+        self._entry(motion, 6, "包裹YOLO阈值", self.yolo_conf_var)
+        self._entry(motion, 7, "面单阈值", self.waybill_conf_var)
+        self._entry(motion, 8, "条码OBB阈值", self.barcode_conf_var)
+        self._entry(motion, 9, "附加命令行参数", self.extra_args_var)
 
         ttk.Label(
             parent,
@@ -276,6 +423,7 @@ class SystemDesktopApp:
                 return None
         try:
             speed = float(self.speed_var.get())
+            d_rotation_speed = float(self.d_rotation_speed_var.get())
             standoff = float(self.standoff_var.get())
             pickup_down = float(self.pickup_down_var.get())
             yolo_conf = float(self.yolo_conf_var.get())
@@ -286,7 +434,7 @@ class SystemDesktopApp:
         except ValueError:
             messagebox.showerror("参数错误", "速度、距离、端口和置信度必须是有效数字。")
             return None
-        if speed <= 0 or standoff < 0 or pickup_down < 0:
+        if speed <= 0 or d_rotation_speed <= 0 or standoff < 0 or pickup_down < 0:
             messagebox.showerror("参数错误", "速度必须大于0，距离不能小于0。")
             return None
         if not all(0 < value <= 1 for value in (yolo_conf, waybill_conf, barcode_conf)):
@@ -323,6 +471,7 @@ class SystemDesktopApp:
             "--tool-contact-axis", "minus-z",
             "--robot-ip", self.robot_ip_var.get().strip(),
             "--robot-speed-mm-s", str(speed),
+            "--d-safe-rotation-speed-mm-s", str(d_rotation_speed),
             "--standoff-mm", str(standoff),
             "--pickup-down-mm", str(pickup_down),
             "--suction-do-port", str(primary_port),
@@ -330,7 +479,6 @@ class SystemDesktopApp:
             "--secondary-suction-offset-y-mm", "-245",
             "--disable-third-suction",
             "--disable-fourth-suction",
-            "--cup-volume-check",
             "--yolo-model", str(Path(self.package_model_var.get()).resolve()),
             "--yolo-conf", str(yolo_conf),
             "--waybill-model", str(Path(self.waybill_model_var.get()).resolve()),
@@ -338,6 +486,7 @@ class SystemDesktopApp:
             "--barcode-model", str(Path(self.barcode_model_var.get()).resolve()),
             "--barcode-conf", str(barcode_conf),
         ]
+        cmd.extend(DEFAULT_MAIN_OPTIONS)
         if self.dry_run_var.get():
             cmd.append("--dry-run")
         else:
@@ -368,6 +517,7 @@ class SystemDesktopApp:
         if validated is None:
             return
         cmd, environment = validated
+        self._restart_hikvision_preview(show_error=False)
         self._clear_runtime_state()
         try:
             self.process = subprocess.Popen(
@@ -428,6 +578,25 @@ class SystemDesktopApp:
                     self.motion_var.set("停止")
                     self._set_controls(False)
                     self._event("系统", f"主程序退出，代码 {payload}")
+                elif kind == "huaray_status":
+                    state, detail = payload
+                    if state == "在线":
+                        self.huaray_label.configure(text="等待华睿相机画面")
+                        self._event("D点读码器", f"已连接：{detail}")
+                    else:
+                        self.huaray_label.configure(
+                            image="",
+                            text=f"华睿读码器{state}\n{detail}",
+                        )
+                elif kind == "hikvision_status":
+                    state, detail = payload
+                    if state == "在线":
+                        self.camera_var.set("在线")
+                    elif self.hikvision_photo is None:
+                        self.hikvision_label.configure(
+                            image="",
+                            text=f"海康相机{state}\n{detail}",
+                        )
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -463,10 +632,38 @@ class SystemDesktopApp:
         if "GUI STOP pressed" in line or "stopping robot motion" in line:
             self.motion_var.set("已停止")
             self._event("停止", line)
-        barcode_match = re.search(r"barcode=([^\s,)]+)", line, re.IGNORECASE)
-        if barcode_match:
-            self.barcode_var.set(barcode_match.group(1))
-            self._event("条码", barcode_match.group(1))
+        if "At functional placement D for candidate" in line:
+            # Accept SDK preview codes only while the current parcel is at D.
+            # Do not skip the current artifact: the reader can decode and write
+            # huaray.json just before the robot process emits this D-arrival
+            # line.  Snapshotting its mtime here caused that valid result to be
+            # treated as old data and never shown before the short D -> A* return.
+            self.huaray_barcode_window_open = True
+            self.last_huaray_displayed_code = None
+            # Ignore durable detections accumulated before this package reached
+            # D.  Any successful D frame increments the publisher sequence and
+            # remains available even after later frames contain no barcode.
+            huaray_path = DEFAULT_GUI_FRAME_DIR / "huaray.json"
+            try:
+                current_payload = json.loads(huaray_path.read_text(encoding="utf-8"))
+                self.last_huaray_detection_sequence = huaray_detection_sequence(
+                    current_payload
+                )
+            except (OSError, ValueError):
+                self.last_huaray_detection_sequence = 0
+            self.last_huaray_mtime = 0.0
+        barcode_event = barcode_from_log_line(line)
+        if barcode_event is not None:
+            event_type, barcode = barcode_event
+            self.barcode_var.set(barcode)
+            self._event(event_type, barcode)
+        elif resets_barcode_display(line):
+            # This is the only barcode-cycle boundary.  Keep accepting a D
+            # result throughout the empty return and while waiting at A*, since
+            # the reader may publish a valid decode after the robot gets there.
+            self.huaray_barcode_window_open = False
+            self.last_huaray_displayed_code = None
+            self.barcode_var.set(NO_BARCODE_TEXT)
         if "ERROR" in line or "failed" in line.lower():
             self.last_event_var.set(line[-110:])
 
@@ -484,26 +681,67 @@ class SystemDesktopApp:
             for filename, label, attribute in (
                 ("color.jpg", self.color_label, "color_photo"),
                 ("depth.jpg", self.depth_label, "depth_photo"),
+                ("hikvision.jpg", self.hikvision_label, "hikvision_photo"),
+                ("huaray.jpg", self.huaray_label, "huaray_photo"),
             ):
                 path = DEFAULT_GUI_FRAME_DIR / filename
                 if path.is_file() and path.stat().st_mtime > self.frame_mtimes[filename]:
                     self.frame_mtimes[filename] = path.stat().st_mtime
-                    image = Image.open(path).convert("RGB")
-                    image.thumbnail((560, 460), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(image)
-                    setattr(self, attribute, photo)
-                    label.configure(image=photo, text="")
-            results_path = DEFAULT_WAYBILL_OUTPUT / "results.jsonl"
-            if results_path.is_file() and results_path.stat().st_mtime > self.last_waybill_mtime:
-                self.last_waybill_mtime = results_path.stat().st_mtime
-                lines = [line for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-                if lines:
-                    latest = json.loads(lines[-1])
-                    if latest.get("barcode"):
-                        self.barcode_var.set(str(latest["barcode"]))
+                    # Pillow otherwise keeps the Windows file handle alive until
+                    # garbage collection, racing the producer's os.replace().
+                    with Image.open(path) as source:
+                        self.frame_images[filename] = source.convert("RGB")
+                    # Force a fresh fit even when only the source frame changed.
+                    self.frame_render_sizes.pop(filename, None)
+                self._render_preview(filename, label, attribute)
+            huaray_path = DEFAULT_GUI_FRAME_DIR / "huaray.json"
+            if huaray_path.is_file() and huaray_path.stat().st_mtime > self.last_huaray_mtime:
+                self.last_huaray_mtime = huaray_path.stat().st_mtime
+                if self.huaray_barcode_window_open:
+                    payload = json.loads(huaray_path.read_text(encoding="utf-8"))
+                    barcode_event = barcode_event_from_huaray_payload(payload)
+                    if barcode_event is None:
+                        code = None
+                    else:
+                        sequence, code = barcode_event
+                        if (
+                            sequence is not None
+                            and sequence <= self.last_huaray_detection_sequence
+                        ):
+                            code = None
+                        elif sequence is not None:
+                            self.last_huaray_detection_sequence = sequence
+                    if code and code != self.last_huaray_displayed_code:
+                        self.last_huaray_displayed_code = code
+                        self.barcode_var.set(code)
+                        self._event("D点SDK条码", code)
         except Exception:
             pass
-        self.root.after(1000, self._refresh_artifacts)
+        self.root.after(200, self._refresh_artifacts)
+
+    def _render_preview(
+        self,
+        filename: str,
+        label: ttk.Label,
+        attribute: str,
+    ) -> None:
+        """Fit a preview inside its current grid cell without cropping or stretching."""
+        source = self.frame_images.get(filename)
+        if source is None:
+            return
+        available_width = max(1, label.winfo_width() - 8)
+        available_height = max(1, label.winfo_height() - 8)
+        if available_width <= 10 or available_height <= 10:
+            return
+        available = (available_width, available_height)
+        if self.frame_render_sizes.get(filename) == available:
+            return
+        image = source.copy()
+        image.thumbnail(available, Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        setattr(self, attribute, photo)
+        label.configure(image=photo, text="")
+        self.frame_render_sizes[filename] = available
 
     def _set_controls(self, running: bool) -> None:
         self.launch_button.configure(state="disabled" if running else "normal")
@@ -518,7 +756,34 @@ class SystemDesktopApp:
         self.analysis_var.set("等待")
         self.motion_var.set("停止")
         self.package_var.set("0")
-        self.barcode_var.set("--")
+        self.barcode_var.set(NO_BARCODE_TEXT)
+        self.huaray_barcode_window_open = False
+        self.last_huaray_displayed_code = None
+
+    def _restart_hikvision_preview(self, show_error: bool = True) -> None:
+        camera_ip = self.hik_ip_var.get().strip()
+        username = self.hik_user_var.get().strip()
+        password = self.hik_password_var.get()
+        if not camera_ip or not username or not password:
+            if show_error:
+                messagebox.showerror("海康参数缺失", "请填写海康相机IP、用户名和密码。")
+            return
+        if self.hikvision_preview is not None:
+            self.hikvision_preview.stop()
+        self.hikvision_label.configure(
+            image="",
+            text=f"正在连接C点海康相机\n{camera_ip}",
+        )
+        self.hikvision_preview = HikvisionPreviewPublisher(
+            DEFAULT_GUI_FRAME_DIR / "hikvision.jpg",
+            camera_ip=camera_ip,
+            username=username,
+            password=password,
+            status_callback=lambda state, detail: self.events.put(
+                ("hikvision_status", (state, detail))
+            ),
+        )
+        self.hikvision_preview.start()
 
     def _open_offline_gui(self) -> None:
         subprocess.Popen([str(PROJECT_ROOT / ".venv" / "Scripts" / "pythonw.exe"), str(OFFLINE_GUI)], cwd=str(PROJECT_ROOT))
@@ -547,6 +812,9 @@ class SystemDesktopApp:
                 return
             self._send("STOP")
             self._send("QUIT")
+        self.huaray_preview.stop()
+        if self.hikvision_preview is not None:
+            self.hikvision_preview.stop()
         self.root.destroy()
 
 

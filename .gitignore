@@ -49,6 +49,7 @@ Desktop.ini
 logs/
 Log/
 _rokae_log_/
+calibration_suite/runtime_logs/
 tmp/
 temp/
 *.tmp

@@ -118,6 +118,37 @@ class RotationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "setDefaultConfOpt failed"):
             client.set_conf_data_forced(True)
 
+    def test_motion_entry_points_sync_controller_conf_policy(self):
+        from project0714_calib.xcore_robot import MotionOptions, XCoreRobotClient
+
+        calls = (
+            lambda client, options: client.move_to_pose_mm_deg(
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, options=options
+            ),
+            lambda client, options: client.move_linear_path_mm_deg(
+                [(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0)], options=options
+            ),
+            lambda client, options: client.move_path_mm_deg(
+                [(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, "movej", 0.0)], options=options
+            ),
+        )
+        for use_current in (False, True):
+            for invoke in calls:
+                with self.subTest(use_current=use_current, invoke=invoke):
+                    client = XCoreRobotClient.__new__(XCoreRobotClient)
+                    client._validate_motion_request = MagicMock()
+                    client.prepare_motion = MagicMock()
+                    client.set_conf_data_forced = MagicMock()
+                    client.read_current_pose = MagicMock(
+                        side_effect=RuntimeError("stop after policy synchronization")
+                    )
+                    options = MotionOptions(use_current_conf_data=use_current)
+
+                    with self.assertRaisesRegex(RuntimeError, "stop after policy"):
+                        invoke(client, options)
+
+                    client.set_conf_data_forced.assert_called_once_with(use_current)
+
     def test_auto_conf_failure_does_not_retry(self):
         robot, _ = self.run_mocked(fail_at=1, motion="movej", conf="auto")
         self.assertEqual(robot.move_to_pose_mm_deg.call_count, 2)

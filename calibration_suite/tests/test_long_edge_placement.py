@@ -19,6 +19,7 @@ import surface_cluster_grasp as grasp
 from project0714_calib.common import rpy_xyz_to_matrix
 from surface_cluster_grasp import (
     FIXED_GRASP_X_YAW_DEG,
+    LatestRGBDFrameBuffer,
     WAYPOINT_D,
     ClusterCandidate,
     SuctionCupSpec,
@@ -29,9 +30,14 @@ from surface_cluster_grasp import (
     interpolated_orientation_steps_deg,
     placement_local_z_delta_deg,
     placement_alignment_error_deg,
+    pickup_alignment_allows_direct_c_to_d,
     placement_aligned_pickup_rpy_candidates,
     placement_tcp_waypoint_for_selected_cup,
+    progressive_placement_fallback_angles_deg,
+    move_empty_rotation_safe_to_b,
     receive_barcode_from_tcp_client,
+    reverse_placement_trial_angles_deg,
+    retreat_to_b_when_no_packages,
     require_selected_cup_at_functional_waypoint,
     rotate_selected_cup_at_functional_waypoint,
     rotate_waypoint_about_local_z,
@@ -47,6 +53,227 @@ from surface_cluster_grasp import (
 
 
 class LongEdgePlacementTests(unittest.TestCase):
+    @staticmethod
+    def _candidate(class_name: str) -> ClusterCandidate:
+        return ClusterCandidate(
+            index=1,
+            center_pixel=(10, 10),
+            hull_pixels=np.asarray([[0, 0], [20, 0], [20, 20], [0, 20]]),
+            support_region_id="bin",
+            support_region_name="bin",
+            point_camera_mm=np.zeros(3),
+            point_base_mm=np.zeros(3),
+            normal_camera=np.asarray([0.0, 0.0, -1.0]),
+            normal_base=np.asarray([0.0, 0.0, 1.0]),
+            height_mm=20.0,
+            flatness_mm=1.0,
+            point_count=100,
+            class_name=class_name,
+        )
+
+    def test_soft_package_skips_long_edge_pickup_and_d_rotation(self) -> None:
+        candidate = self._candidate("soft_parcel")
+        current_pose = SimpleNamespace(rpy_rad_xyz=np.zeros(3))
+        args = build_parser().parse_args([])
+
+        self.assertEqual(
+            placement_aligned_pickup_rpy_candidates(candidate, current_pose, args),
+            [],
+        )
+        safe, placed, rotation_deg, error_deg = grasp.aligned_placement_waypoints(
+            candidate, np.zeros(3)
+        )
+        self.assertIs(safe, grasp.WAYPOINT_D_ROTATE_SAFE)
+        self.assertIs(placed, grasp.WAYPOINT_D)
+        self.assertEqual((rotation_deg, error_deg), (0.0, 0.0))
+
+    def test_loaded_b_and_c_keep_restored_a_star_configuration_locked(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.settled_b_pose = SimpleNamespace(
+                    rpy_deg_xyz=lambda: np.asarray(
+                        [grasp.WAYPOINT_B.rx_deg, grasp.WAYPOINT_B.ry_deg, grasp.WAYPOINT_B.rz_deg]
+                    ),
+                    conf_data=[1.0, 2.0, 3.0, 4.0],
+                )
+
+            def read_current_pose(self):
+                return self.settled_b_pose
+
+        robot = FakeRobot()
+        with patch.object(grasp, "move_pose_with_singularity_fallback") as move:
+            grasp.move_loaded_through_b_to_c(
+                robot,
+                grasp.MotionOptions(),
+                np.asarray(
+                    [
+                        grasp.WAYPOINT_A_STAR.rx_deg,
+                        grasp.WAYPOINT_A_STAR.ry_deg,
+                        grasp.WAYPOINT_A_STAR.rz_deg,
+                    ]
+                ),
+                pass_through_zone_mm=30.0,
+            )
+
+        self.assertEqual(move.call_count, 2)
+        b_call, c_call = move.call_args_list
+        self.assertEqual(b_call.args[1:4], (grasp.WAYPOINT_B.x_mm, grasp.WAYPOINT_B.y_mm, grasp.WAYPOINT_B.z_mm))
+        self.assertEqual(c_call.args[1:4], (grasp.WAYPOINT_C_BARCODE.x_mm, grasp.WAYPOINT_C_BARCODE.y_mm, grasp.WAYPOINT_C_BARCODE.z_mm))
+        self.assertEqual(b_call.args[7].motion, "movej")
+        self.assertTrue(b_call.args[7].use_current_conf_data)
+        self.assertEqual(b_call.args[7].zone_mm, 0.0)
+        self.assertEqual(c_call.args[7].motion, "movej")
+        self.assertTrue(c_call.args[7].use_current_conf_data)
+        self.assertEqual(c_call.args[7].zone_mm, 0.0)
+        self.assertFalse(c_call.kwargs["allow_clear_confdata_retry"])
+
+    def test_empty_d_return_blends_through_c_and_b_then_stops_at_a_star(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.path = None
+
+            def read_current_pose(self):
+                return SimpleNamespace(
+                    translation_mm=lambda: np.asarray(
+                        [grasp.WAYPOINT_D.x_mm, grasp.WAYPOINT_D.y_mm, grasp.WAYPOINT_D.z_mm]
+                    ),
+                    rpy_deg_xyz=lambda: np.asarray([-0.35, 3.12, 147.66]),
+                )
+
+            def move_path_mm_deg(self, path, options):
+                self.path = path
+                return SimpleNamespace(rpy_deg_xyz=lambda: np.asarray(path[-1][3:6]))
+
+        robot = FakeRobot()
+        grasp.return_empty_from_d_through_c_b(
+            robot,
+            grasp.MotionOptions(),
+            pass_through_zone_mm=30.0,
+        )
+        self.assertEqual(len(robot.path), 4)
+        self.assertEqual(robot.path[0][6:], ("movej", 30.0))
+        self.assertEqual(robot.path[1][6:], ("movej", 30.0))
+        self.assertEqual(robot.path[2][6:], ("movej", 30.0))
+        self.assertEqual(robot.path[3][6:], ("movej", 0.0))
+        self.assertEqual(robot.path[1][:3], (
+            grasp.WAYPOINT_C.x_mm, grasp.WAYPOINT_C.y_mm, grasp.WAYPOINT_C.z_mm
+        ))
+        self.assertEqual(robot.path[2][:3], (
+            grasp.WAYPOINT_B.x_mm, grasp.WAYPOINT_B.y_mm, grasp.WAYPOINT_B.z_mm
+        ))
+        self.assertEqual(robot.path[3][:3], (
+            grasp.WAYPOINT_A_STAR.x_mm,
+            grasp.WAYPOINT_A_STAR.y_mm,
+            grasp.WAYPOINT_A_STAR.z_mm,
+        ))
+
+    def test_latest_rgbd_buffer_returns_distinct_new_sequences(self) -> None:
+        class FakeCamera:
+            def __init__(self) -> None:
+                self.value = 0
+
+            def get_frames(self, _timeout_ms: int):
+                threading.Event().wait(0.005)
+                self.value += 1
+                frame = np.full((2, 2), self.value, dtype=np.uint16)
+                return frame, frame, frame.astype(np.uint8)
+
+        buffer = LatestRGBDFrameBuffer(FakeCamera(), 20)
+        buffer.start()
+        try:
+            first = buffer.get_latest(500)
+            self.assertIsNotNone(first)
+            first_sequence, _first_frames = first
+            second = buffer.get_latest(500, after_sequence=first_sequence)
+            self.assertIsNotNone(second)
+            second_sequence, _second_frames = second
+            self.assertGreater(second_sequence, first_sequence)
+        finally:
+            buffer.stop()
+
+    def test_next_scene_suction_plans_are_precomputed_from_a_star(self) -> None:
+        candidate = self._candidate("soft_parcel")
+        analysis = grasp.AnalysisResult(
+            color_bgr=np.zeros((2, 2, 3), dtype=np.uint8),
+            depth_mm=np.zeros((2, 2), dtype=np.uint16),
+            depth_display=np.zeros((2, 2), dtype=np.uint8),
+            base_plane=None,
+            candidates=[candidate],
+            notes=[],
+        )
+        args = build_parser().parse_args([])
+        sentinel_plan = object()
+
+        with patch.object(
+            grasp,
+            "compute_approach_geometry_from_pose",
+            return_value=(
+                np.asarray([1.0, 2.0, 3.0]),
+                np.asarray([1.0, 2.0, 2.0]),
+                np.zeros(3),
+                "test",
+                [("test", np.zeros(3))],
+            ),
+        ) as compute, patch.object(
+            grasp,
+            "build_suction_approach_plans",
+            return_value=[sentinel_plan],
+        ) as build:
+            plans = grasp.precompute_suction_plans_from_a_star(analysis, args, None)
+
+        planning_pose = compute.call_args.args[1]
+        np.testing.assert_allclose(
+            planning_pose.translation_mm(),
+            [grasp.WAYPOINT_A_STAR.x_mm, grasp.WAYPOINT_A_STAR.y_mm, grasp.WAYPOINT_A_STAR.z_mm],
+        )
+        np.testing.assert_allclose(
+            build.call_args.args[2], planning_pose.translation_mm()
+        )
+        self.assertEqual(plans[candidate.index], [sentinel_plan])
+
+    def test_no_detected_package_moves_empty_tool_from_a_star_to_b(self) -> None:
+        a_star_pose = SimpleNamespace(
+            translation_mm=lambda: np.asarray(
+                [grasp.WAYPOINT_A_STAR.x_mm, grasp.WAYPOINT_A_STAR.y_mm, grasp.WAYPOINT_A_STAR.z_mm]
+            ),
+            rpy_rad_xyz=np.radians(
+                [grasp.WAYPOINT_A_STAR.rx_deg, grasp.WAYPOINT_A_STAR.ry_deg, grasp.WAYPOINT_A_STAR.rz_deg]
+            ),
+        )
+        robot = SimpleNamespace(read_current_pose=lambda: a_star_pose)
+
+        with patch.object(grasp, "move_empty_to_waypoint_segmented") as move:
+            handled = retreat_to_b_when_no_packages(
+                [], robot, grasp.MotionOptions(), dry_run=False
+            )
+
+        self.assertTrue(handled)
+        move.assert_called_once_with(grasp.WAYPOINT_B, robot, unittest.mock.ANY)
+
+    def test_detected_package_does_not_trigger_camera_clear_retreat(self) -> None:
+        robot = SimpleNamespace(read_current_pose=lambda: None)
+
+        with patch.object(grasp, "move_empty_to_waypoint_segmented") as move:
+            handled = retreat_to_b_when_no_packages(
+                [self._candidate("parcel_box")], robot, grasp.MotionOptions(), dry_run=False
+            )
+
+        self.assertFalse(handled)
+        move.assert_not_called()
+
+    def test_demo_workspace_extends_to_negative_550_mm(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.workspace_x_min_mm, -550.0)
+
+    def test_d_safe_rotation_has_independent_speed(self) -> None:
+        defaults = build_parser().parse_args([])
+        configured = build_parser().parse_args(
+            ["--robot-speed-mm-s", "400", "--d-safe-rotation-speed-mm-s", "60"]
+        )
+        self.assertEqual(defaults.d_safe_rotation_speed_mm_s, 80.0)
+        self.assertEqual(configured.robot_speed_mm_s, 400.0)
+        self.assertEqual(configured.d_safe_rotation_speed_mm_s, 60.0)
+
     def test_verified_fallbacks_are_ranked_by_alignment_not_interpolated(self) -> None:
         angles = verified_placement_fallback_angles_deg(
             requested_deg=74.3,
@@ -61,12 +288,28 @@ class LongEdgePlacementTests(unittest.TestCase):
         self.assertAlmostEqual(placement_alignment_error_deg(74.3, 0.0), 74.3)
         self.assertAlmostEqual(placement_alignment_error_deg(179.0, 1.0), 2.0)
 
-    def test_placement_safety_defaults_require_explicit_degraded_opt_in(self) -> None:
+    def test_aligned_pickup_skips_loaded_rotation_safe_waypoint(self) -> None:
+        self.assertTrue(pickup_alignment_allows_direct_c_to_d(0.0, 5.0))
+        self.assertTrue(pickup_alignment_allows_direct_c_to_d(-4.99, 5.0))
+        self.assertTrue(pickup_alignment_allows_direct_c_to_d(175.0, 5.0))
+        self.assertFalse(pickup_alignment_allows_direct_c_to_d(5.01, 5.0))
+
+    def test_placement_defaults_prefer_alignment_without_blocking_safe_rotation(self) -> None:
         args = build_parser().parse_args([])
 
         self.assertEqual(list(args.verified_placement_angles_deg), [0.0])
         self.assertEqual(args.max_placement_alignment_error_deg, 5.0)
-        self.assertFalse(args.allow_degraded_placement)
+        self.assertTrue(args.allow_degraded_placement)
+        strict_args = build_parser().parse_args(["--require-aligned-placement"])
+        self.assertFalse(strict_args.allow_degraded_placement)
+        self.assertEqual(args.max_controller_plan_attempts, 8)
+        self.assertEqual(args.max_auto_conf_singularity_attempts, 2)
+        self.assertFalse(args.disable_auto_conf_singularity_recovery)
+        self.assertEqual(
+            list(args.singularity_recovery_yaw_offsets_deg),
+            [2.0, -2.0, 4.0, -4.0],
+        )
+        self.assertEqual(args.auto_cycle_settle_s, 0.0)
 
     def test_primary_and_secondary_use_independent_verified_angles(self) -> None:
         args = build_parser().parse_args([
@@ -84,6 +327,50 @@ class LongEdgePlacementTests(unittest.TestCase):
         self.assertAlmostEqual(angles[1], 38.44)
         self.assertAlmostEqual(angles[-1], 0.0)
         self.assertTrue(all(a > b for a, b in zip(angles, angles[1:])))
+
+    def test_progressive_d_search_tries_each_step_before_verified_fallback(self) -> None:
+        angles = progressive_placement_fallback_angles_deg(
+            requested_deg=86.31,
+            current_deg=86.31,
+            verified_angles_deg=[0.0],
+            step_deg=10.0,
+        )
+
+        self.assertAlmostEqual(angles[0], 76.31)
+        self.assertAlmostEqual(angles[1], 66.31)
+        self.assertAlmostEqual(angles[-1], 0.0)
+        self.assertTrue(all(a > b for a, b in zip(angles, angles[1:])))
+
+    def test_progressive_d_search_orders_verified_targets_by_alignment(self) -> None:
+        angles = progressive_placement_fallback_angles_deg(
+            requested_deg=42.0,
+            current_deg=42.0,
+            verified_angles_deg=[0.0, 30.0],
+            step_deg=10.0,
+        )
+
+        self.assertEqual(angles[:2], [32.0, 30.0])
+        self.assertEqual(angles[-1], 0.0)
+
+    def test_reverse_d_search_stops_at_45_degrees_then_tries_original(self) -> None:
+        angles = reverse_placement_trial_angles_deg(
+            requested_deg=80.0,
+            current_deg=80.0,
+            original_deg=0.0,
+            step_deg=10.0,
+            max_alignment_error_deg=45.0,
+        )
+        self.assertEqual(angles, [70.0, 60.0, 50.0, 40.0, 0.0])
+
+    def test_reverse_d_search_uses_actual_high_point_entry_angle(self) -> None:
+        angles = reverse_placement_trial_angles_deg(
+            requested_deg=-55.0,
+            current_deg=-55.0,
+            original_deg=-5.0,
+            step_deg=10.0,
+            max_alignment_error_deg=45.0,
+        )
+        self.assertEqual(angles, [-45.0, -35.0, -25.0, -15.0, -5.0])
 
     def test_restart_orientation_bridge_splits_large_d_to_b_rotation(self) -> None:
         start = np.asarray([-1.21, 2.90, 131.56])
@@ -108,7 +395,37 @@ class LongEdgePlacementTests(unittest.TestCase):
             atol=1e-9,
         )
 
-    def test_empty_d_return_lifts_then_unwinds_at_rotation_safe_point(self) -> None:
+    def test_restart_recovery_accepts_existing_d_safe_high_pose(self) -> None:
+        high_xyz = np.asarray([34.4, 702.9, 524.8])
+        high_rpy = np.asarray([-0.02, 2.45, 141.29])
+        robot = SimpleNamespace(
+            read_current_pose=lambda: SimpleNamespace(
+                translation_mm=lambda: high_xyz.copy(),
+                rpy_deg_xyz=lambda: high_rpy.copy(),
+            )
+        )
+        rotation_xyz: list[np.ndarray] = []
+        reached_waypoints: list[object] = []
+
+        with patch.object(
+            grasp,
+            "move_pose_with_singularity_fallback",
+            side_effect=lambda _robot, x, y, z, *_args, **_kwargs: rotation_xyz.append(
+                np.asarray([x, y, z])
+            ),
+        ), patch.object(
+            grasp,
+            "move_waypoint",
+            side_effect=lambda waypoint, *_args, **_kwargs: reached_waypoints.append(waypoint),
+        ):
+            grasp.recover_empty_tool_from_d_to_b(robot, grasp.MotionOptions())
+
+        self.assertTrue(rotation_xyz)
+        for xyz in rotation_xyz:
+            np.testing.assert_allclose(xyz, high_xyz)
+        self.assertEqual(reached_waypoints, [grasp.WAYPOINT_B])
+
+    def test_empty_d_return_only_lifts_at_rotation_safe_point(self) -> None:
         cup = SuctionCupSpec("primary", 6, np.zeros(3))
         calls: list[tuple[str, float]] = []
 
@@ -117,12 +434,6 @@ class LongEdgePlacementTests(unittest.TestCase):
             "move_selected_cup_to_functional_waypoint",
             side_effect=lambda waypoint, *_args, **_kwargs: calls.append(
                 ("lift", waypoint.rz_deg)
-            ),
-        ), patch.object(
-            grasp,
-            "rotate_selected_cup_at_functional_waypoint",
-            side_effect=lambda _waypoint, target, *_args, **kwargs: calls.append(
-                ("unwind", kwargs["start_local_z_deg"] - target)
             ),
         ):
             return_empty_from_d_via_rotation_safe(
@@ -135,9 +446,29 @@ class LongEdgePlacementTests(unittest.TestCase):
 
         self.assertEqual(
             [name for name, _value in calls],
-            ["lift", "listen", "unwind"],
+            ["lift", "listen"],
         )
-        self.assertAlmostEqual(calls[2][1], 48.0)
+
+    def test_empty_tool_normalizes_while_moving_to_b(self) -> None:
+        pose = SimpleNamespace(
+            translation_mm=lambda: np.asarray([-17.6, 577.4, 526.3], dtype=np.float64),
+            rpy_deg_xyz=lambda: np.asarray([-0.02, 2.45, 141.37], dtype=np.float64)
+        )
+        robot = SimpleNamespace(read_current_pose=lambda: pose)
+        commands: list[tuple[float, ...]] = []
+
+        with patch.object(
+            grasp,
+            "move_pose_with_singularity_fallback",
+            side_effect=lambda _robot, *values, **_kwargs: commands.append(values),
+        ):
+            move_empty_rotation_safe_to_b(robot, grasp.MotionOptions())
+
+        self.assertEqual(len(commands), 3)
+        self.assertAlmostEqual(commands[-1][0], grasp.WAYPOINT_B.x_mm)
+        self.assertAlmostEqual(commands[-1][1], grasp.WAYPOINT_B.y_mm)
+        self.assertAlmostEqual(commands[-1][2], grasp.WAYPOINT_B.z_mm)
+        self.assertAlmostEqual(commands[-1][5], grasp.WAYPOINT_B.rz_deg)
 
     def test_c_side_view_is_only_needed_when_bottom_and_back_have_no_waybill(self) -> None:
         self.assertTrue(should_inspect_c_side_view(None))
@@ -158,8 +489,16 @@ class LongEdgePlacementTests(unittest.TestCase):
 
         self.assertEqual(args.barcode_reader_bind_ip, "192.168.2.100")
         self.assertEqual(args.barcode_reader_port, 3001)
-        self.assertEqual(args.place_dwell_s, 2.0)
+        self.assertEqual(args.place_dwell_s, 0.0)
         self.assertEqual(args.barcode_reader_timeout_s, 3.0)
+
+    def test_waybill_capture_defaults_reduce_fixed_robot_dwell(self) -> None:
+        args = build_parser().parse_args([])
+
+        self.assertEqual(args.waybill_start_delay_s, 0.0)
+        self.assertEqual(args.waybill_c_settle_s, 0.4)
+        self.assertEqual(args.waybill_post_c_capture_s, 1.5)
+        self.assertEqual(args.waybill_c_dwell_s, 2.0)
 
     def test_barcode_reader_accepts_tcp_client_payload(self) -> None:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -249,6 +588,21 @@ class LongEdgePlacementTests(unittest.TestCase):
             [6, 5, 4, 3],
         )
         self.assertTrue(all(call.args[2] is False for call in set_output.call_args_list))
+
+    def test_disabled_pickup_cups_remain_physical_collision_bodies(self) -> None:
+        args = build_parser().parse_args([
+            "--disable-third-suction",
+            "--disable-fourth-suction",
+        ])
+
+        self.assertEqual(
+            [cup.name for cup in grasp.suction_cup_specs(args)],
+            ["primary", "secondary"],
+        )
+        self.assertEqual(
+            [cup.name for cup in grasp.physical_suction_cup_specs(args)],
+            ["primary", "secondary", "third", "fourth"],
+        )
 
     def test_default_configuration_includes_perpendicular_third_cup(self) -> None:
         args = build_parser().parse_args([])
@@ -582,6 +936,86 @@ class LongEdgePlacementTests(unittest.TestCase):
         self.assertTrue(calls[0].use_current_conf_data)
         self.assertFalse(calls[1].use_current_conf_data)
 
+    def test_high_clearance_recovery_uses_auto_conf_only_before_movel(self) -> None:
+        a_star_xyz = np.asarray(
+            [grasp.WAYPOINT_A_STAR.x_mm, grasp.WAYPOINT_A_STAR.y_mm, grasp.WAYPOINT_A_STAR.z_mm]
+        )
+        a_star_rpy = np.asarray(
+            [grasp.WAYPOINT_A_STAR.rx_deg, grasp.WAYPOINT_A_STAR.ry_deg, grasp.WAYPOINT_A_STAR.rz_deg]
+        )
+
+        def pose(xyz, rpy, conf, elbow):
+            return SimpleNamespace(
+                translation_mm=lambda: np.asarray(xyz, dtype=np.float64),
+                rpy_deg_xyz=lambda: np.asarray(rpy, dtype=np.float64),
+                rpy_rad_xyz=np.radians(rpy),
+                conf_data=list(conf),
+                elbow=float(elbow),
+            )
+
+        a_star_pose = pose(a_star_xyz, a_star_rpy, [0, 0, 0, 0], 0.0)
+        reached_pose = pose([180.0, -760.0, 200.0], [2.0, -4.0, -88.0], [1, 0, 0, 0], 1.0)
+        move_options = []
+        conf_policy = []
+
+        robot = SimpleNamespace(
+            read_current_pose=lambda: a_star_pose,
+            read_current_joints_rad=lambda: np.radians(
+                [6.277, 20.0, 40.0, -100.0, 80.0, 10.0]
+            ),
+            set_conf_data_forced=lambda forced: conf_policy.append(forced),
+        )
+
+        def fake_move(*_args, **kwargs):
+            move_options.append(kwargs["motion_options"] if "motion_options" in kwargs else _args[7])
+            return reached_pose
+
+        with patch.object(grasp, "move_pose_with_singularity_fallback", side_effect=fake_move):
+            result = grasp.move_empty_approach_to_a(
+                robot,
+                np.asarray([180.0, -760.0, 200.0]),
+                np.asarray([2.0, -4.0, -88.0]),
+                grasp.MotionOptions(motion="movej", use_current_conf_data=True),
+                use_auto_conf=True,
+            )
+
+        self.assertEqual(conf_policy, [False, True])
+        self.assertEqual(len(move_options), 1)
+        self.assertEqual(move_options[0].motion, "movej")
+        self.assertFalse(move_options[0].use_current_conf_data)
+        np.testing.assert_allclose(
+            np.degrees(result.a_star_joints_rad),
+            [6.277, 20.0, 40.0, -100.0, 80.0, 10.0],
+            atol=1e-9,
+        )
+
+    def test_a_star_joint_reference_is_session_stable_and_restored_with_moveabsj(self) -> None:
+        original = np.radians([6.0, 20.0, 40.0, -100.0, 80.0, 10.0])
+        wrong_branch = np.radians([6.0, 69.0, 69.0, -191.0, 148.0, 86.0])
+        state = {"joints": original.copy()}
+        restores = []
+
+        def restore(joints, options):
+            restores.append((np.asarray(joints).copy(), options))
+            state["joints"] = np.asarray(joints).copy()
+
+        robot = SimpleNamespace(
+            read_current_joints_rad=lambda: state["joints"].copy(),
+            move_to_joint_positions_rad=restore,
+        )
+        options = grasp.MotionOptions(speed_mm_s=150.0)
+
+        first = grasp.capture_or_restore_a_star_joint_reference(robot, options)
+        state["joints"] = wrong_branch.copy()
+        second = grasp.capture_or_restore_a_star_joint_reference(robot, options)
+
+        np.testing.assert_allclose(first, original)
+        np.testing.assert_allclose(second, original)
+        self.assertEqual(len(restores), 1)
+        np.testing.assert_allclose(restores[0][0], original)
+        self.assertEqual(restores[0][1].speed_mm_s, 150.0)
+        self.assertEqual(restores[0][1].zone_mm, 0.0)
+
     def test_return_to_a_star_uses_nearest_equivalent_angle(self) -> None:
         current_pose = SimpleNamespace(
             rpy_deg_xyz=lambda: np.asarray([0.0, 0.0, 173.91], dtype=np.float64)
@@ -674,6 +1108,26 @@ class LongEdgePlacementTests(unittest.TestCase):
         self.assertEqual(fallback_options.motion, "movej")
         self.assertTrue(fallback_options.use_current_conf_data)
 
+    def test_loaded_movej_at_c_keeps_current_confdata_and_cannot_clear_it(self) -> None:
+        current_pose = SimpleNamespace(
+            rpy_deg_xyz=lambda: np.asarray([-0.296, 1.428, -6.094], dtype=np.float64)
+        )
+        robot = SimpleNamespace(read_current_pose=lambda: current_pose)
+        motion_options = grasp.MotionOptions(motion="movej", use_current_conf_data=True)
+
+        with patch.object(grasp, "move_pose_with_singularity_fallback") as move:
+            grasp.move_loaded_transfer_with_singularity_fallback(
+                grasp.WAYPOINT_C_BARCODE_SIDE,
+                robot,
+                motion_options,
+            )
+
+        commanded_options = move.call_args.args[7]
+        self.assertEqual(commanded_options.motion, "movej")
+        self.assertTrue(commanded_options.use_current_conf_data)
+        self.assertFalse(move.call_args.kwargs["allow_clear_confdata_retry"])
+        self.assertFalse(move.call_args.kwargs["allow_movej_singularity_retry"])
+
     def test_default_pickup_uses_fitted_top_plane(self) -> None:
         args = build_parser().parse_args([])
         self.assertEqual(args.normal_mode, "top-plane")
@@ -724,7 +1178,12 @@ class LongEdgePlacementTests(unittest.TestCase):
         )
         args = build_parser().parse_args([])
         candidates = placement_aligned_pickup_rpy_candidates(candidate, current_pose, args)
-        self.assertEqual(len(candidates), 2)
+        self.assertEqual(len(candidates), 10)
+        self.assertNotIn("_singularity_recovery_", candidates[0][0])
+        self.assertNotIn("_singularity_recovery_", candidates[1][0])
+        self.assertTrue(
+            all("_singularity_recovery_" in mode for mode, _rpy in candidates[2:])
+        )
 
         pickup_rotation = rpy_xyz_to_matrix(np.radians(candidates[0][1]))
         delta_deg = placement_local_z_delta_deg(
@@ -743,6 +1202,147 @@ class LongEdgePlacementTests(unittest.TestCase):
         self.assertEqual(selected_rpy.shape, (3,))
         self.assertIsInstance(selected_mode, str)
         self.assertTrue(selected_mode.startswith("align_normal_package_long_for_d"))
+
+    def test_undirected_long_edge_keeps_near_directed_tcp_branch_first(self) -> None:
+        candidate = self._candidate("parcel_box")
+        long_yaw_deg = 178.7
+        long_axis = np.asarray(
+            [np.cos(np.radians(long_yaw_deg)), np.sin(np.radians(long_yaw_deg)), 0.0]
+        )
+        candidate.short_axis_base = np.asarray(
+            [long_axis[1], -long_axis[0], 0.0], dtype=np.float64
+        )
+        current_pose = SimpleNamespace(
+            rpy_rad_xyz=np.radians([0.0, 0.0, -94.661])
+        )
+        args = build_parser().parse_args([])
+        args.tool_contact_axis = "minus-z"
+
+        candidates = placement_aligned_pickup_rpy_candidates(
+            candidate, current_pose, args
+        )
+        self.assertEqual(len(candidates), 10)
+        current_rotation = rpy_xyz_to_matrix(current_pose.rpy_rad_xyz)
+        rotation_distances = [
+            grasp.rotation_distance_deg(
+                current_rotation,
+                rpy_xyz_to_matrix(np.radians(candidate_rpy_deg)),
+            )
+            for _mode, candidate_rpy_deg in candidates
+        ]
+
+        self.assertLess(rotation_distances[0], 10.0)
+        self.assertGreater(rotation_distances[1], 170.0)
+        exact_z = rpy_xyz_to_matrix(np.radians(candidates[0][1]))[:, 2]
+        for mode, recovery_rpy_deg in candidates[2:]:
+            self.assertIn("_singularity_recovery_", mode)
+            recovery_z = rpy_xyz_to_matrix(np.radians(recovery_rpy_deg))[:, 2]
+            np.testing.assert_allclose(recovery_z, exact_z, atol=1e-8)
+
+    def test_long_edge_planning_rejects_opposite_tcp_branch_over_rotation_limit(self) -> None:
+        candidate = self._candidate("parcel_box")
+        long_yaw_deg = 178.7
+        long_axis = np.asarray(
+            [np.cos(np.radians(long_yaw_deg)), np.sin(np.radians(long_yaw_deg)), 0.0]
+        )
+        candidate.short_axis_base = np.asarray(
+            [long_axis[1], -long_axis[0], 0.0], dtype=np.float64
+        )
+        candidate.point_base_mm = np.asarray([0.0, -700.0, 20.0])
+        args = build_parser().parse_args([])
+        args.tool_contact_axis = "minus-z"
+        args.force_suction_cups = ["1", "2"]
+        args.unused_cup_min_clearance_mm = 0.0
+        args.suction_cup_collision_radius_mm = 0.0
+        current_rpy_deg = np.asarray([0.0, 0.0, -94.661])
+        current_pose = SimpleNamespace(rpy_rad_xyz=np.radians(current_rpy_deg))
+        rpy_candidates = placement_aligned_pickup_rpy_candidates(
+            candidate, current_pose, args
+        )
+
+        plans = grasp.build_suction_approach_plans(
+            candidate,
+            [candidate],
+            np.asarray(
+                [grasp.WAYPOINT_A_STAR.x_mm, grasp.WAYPOINT_A_STAR.y_mm, grasp.WAYPOINT_A_STAR.z_mm]
+            ),
+            current_rpy_deg,
+            np.asarray([0.0, -700.0, 120.0]),
+            np.asarray([0.0, -700.0, 20.0]),
+            rpy_candidates,
+            args,
+        )
+
+        self.assertTrue(plans)
+        self.assertTrue(all(plan.pickup_rotation_deg <= 90.0 for plan in plans))
+        self.assertTrue(all(plan.pickup_rotation_deg < 10.0 for plan in plans))
+        self.assertEqual({plan.cup.name for plan in plans}, {"primary", "secondary"})
+        exact_plan_count = next(
+            index
+            for index, plan in enumerate(plans)
+            if "_singularity_recovery_" in plan.rpy_mode
+        )
+        self.assertEqual(exact_plan_count, 2)
+        self.assertTrue(
+            all("_singularity_recovery_" not in plan.rpy_mode for plan in plans[:2])
+        )
+        self.assertTrue(
+            all("_singularity_recovery_" in plan.rpy_mode for plan in plans[2:])
+        )
+        self.assertGreaterEqual(len(plans[: args.max_controller_plan_attempts]), 3)
+
+    def test_b_origin_still_measures_pickup_rotation_from_a_star(self) -> None:
+        candidate = self._candidate("soft_parcel")
+        candidate.point_base_mm = np.asarray([0.0, -700.0, 20.0])
+        args = build_parser().parse_args([])
+        args.force_suction_cups = ["1"]
+        args.unused_cup_min_clearance_mm = 0.0
+        args.suction_cup_collision_radius_mm = 0.0
+        pickup_rpy_deg = np.asarray([0.0, 0.0, -6.0])
+
+        plans = grasp.build_suction_approach_plans(
+            candidate,
+            [candidate],
+            np.asarray([grasp.WAYPOINT_B.x_mm, grasp.WAYPOINT_B.y_mm, grasp.WAYPOINT_B.z_mm]),
+            np.asarray([grasp.WAYPOINT_B.rx_deg, grasp.WAYPOINT_B.ry_deg, grasp.WAYPOINT_B.rz_deg]),
+            np.asarray([0.0, -700.0, 120.0]),
+            np.asarray([0.0, -700.0, 20.0]),
+            [("test", pickup_rpy_deg)],
+            args,
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertGreater(plans[0].pickup_rotation_deg, 80.0)
+        self.assertLess(plans[0].pickup_rotation_deg, 90.0)
+
+    def test_box_plan_with_large_d_turn_uses_rotation_safe_target(self) -> None:
+        candidate = self._candidate("parcel_box")
+        candidate.point_base_mm = np.asarray([0.0, -700.0, 20.0])
+        candidate.short_axis_base = np.asarray([0.0, 1.0, 0.0])
+        args = build_parser().parse_args([])
+        args.force_suction_cups = ["1"]
+        args.unused_cup_min_clearance_mm = 0.0
+        args.suction_cup_collision_radius_mm = 0.0
+
+        plans = grasp.build_suction_approach_plans(
+            candidate,
+            [candidate],
+            np.asarray([grasp.WAYPOINT_A_STAR.x_mm, grasp.WAYPOINT_A_STAR.y_mm, grasp.WAYPOINT_A_STAR.z_mm]),
+            np.asarray([grasp.WAYPOINT_A_STAR.rx_deg, grasp.WAYPOINT_A_STAR.ry_deg, grasp.WAYPOINT_A_STAR.rz_deg]),
+            np.asarray([0.0, -700.0, 120.0]),
+            np.asarray([0.0, -700.0, 20.0]),
+            [("fixed", np.asarray([0.0, 0.0, -6.0]))],
+            args,
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertGreater(abs(plans[0].placement_rotation_deg), 5.0)
+        self.assertAlmostEqual(
+            plans[0].planned_placement_angle_deg,
+            plans[0].placement_rotation_deg,
+        )
+        self.assertEqual(plans[0].placement_quality, "aligned")
+        self.assertAlmostEqual(plans[0].placement_alignment_error_deg, 0.0)
 
     def test_package_long_edge_reaches_platform_long_direction(self) -> None:
         pickup_rotation = rpy_xyz_to_matrix(np.radians([0.0, 0.0, -96.09]))
@@ -804,7 +1404,7 @@ class LongEdgePlacementTests(unittest.TestCase):
                 atol=1e-9,
             )
 
-    def test_secondary_rotation_is_split_into_compensated_steps(self) -> None:
+    def test_secondary_rotation_is_one_compensated_move(self) -> None:
         secondary = SuctionCupSpec(
             name="secondary",
             do_port=5,
@@ -836,7 +1436,7 @@ class LongEdgePlacementTests(unittest.TestCase):
                 max_step_deg=10.0,
             )
 
-        self.assertEqual(len(commanded_physical_waypoints), 9)
+        self.assertEqual(len(commanded_physical_waypoints), 1)
         final_rotation = rpy_xyz_to_matrix(
             np.radians(
                 [
@@ -900,13 +1500,10 @@ class LongEdgePlacementTests(unittest.TestCase):
                 max_step_deg=10.0,
             )
 
-        self.assertEqual(len(commanded_offsets), 6)
+        self.assertEqual(len(commanded_offsets), 1)
         self.assertAlmostEqual(commanded_offsets[-1], 0.0, places=6)
-        self.assertTrue(
-            all(a > b for a, b in zip(commanded_offsets, commanded_offsets[1:]))
-        )
 
-    def test_failed_segmented_rotation_refines_and_keeps_closest_reachable_angle(self) -> None:
+    def test_failed_direct_rotation_restores_start_without_boundary_search(self) -> None:
         primary = SuctionCupSpec("primary", 6, np.zeros(3))
         commanded_offsets = []
         failed_once = False
@@ -924,7 +1521,7 @@ class LongEdgePlacementTests(unittest.TestCase):
             signed = np.degrees(np.arctan2((reference.T @ actual)[1, 0], (reference.T @ actual)[0, 0]))
             commanded_offsets.append(float(signed))
             self.assertFalse(kwargs["allow_current_conf_movej_fallback"])
-            if len(commanded_offsets) == 6 and not failed_once:
+            if len(commanded_offsets) == 1 and not failed_once:
                 failed_once = True
                 raise RuntimeError("-50102 path singularity")
             return physical_waypoint, np.array([physical_waypoint.x_mm, physical_waypoint.y_mm, physical_waypoint.z_mm])
@@ -939,8 +1536,8 @@ class LongEdgePlacementTests(unittest.TestCase):
                 max_step_deg=10.0,
             )
 
-        np.testing.assert_allclose(commanded_offsets[:6], [10, 20, 30, 40, 50, 60], atol=1e-6)
-        self.assertAlmostEqual(commanded_offsets[6], 50.0, places=6)
+        np.testing.assert_allclose(commanded_offsets, [80, 0], atol=1e-6)
+        self.assertEqual(len(commanded_offsets), 2)
         reached_rotation = rpy_xyz_to_matrix(
             np.radians([reached.rx_deg, reached.ry_deg, reached.rz_deg])
         )
@@ -957,8 +1554,27 @@ class LongEdgePlacementTests(unittest.TestCase):
                 (reference_rotation.T @ reached_rotation)[0, 0],
             )
         )
-        self.assertGreater(reached_delta, 59.0)
-        self.assertLess(reached_delta, 60.0)
+        self.assertAlmostEqual(reached_delta, 0.0, places=6)
+
+    def test_near_square_top_uses_whichever_edge_needs_less_d_rotation(self) -> None:
+        candidate = self._candidate("parcel_box")
+        candidate.short_axis_base = np.asarray([0.0, 1.0, 0.0])
+        candidate.top_aspect_ratio = 1.05
+        candidate.near_square_top = True
+
+        _safe, _d, square_delta_deg, square_error_deg = grasp.aligned_placement_waypoints(
+            candidate,
+            np.asarray([0.0, 0.0, 0.0]),
+        )
+        candidate.near_square_top = False
+        _safe, _d, rectangular_delta_deg, _error = grasp.aligned_placement_waypoints(
+            candidate,
+            np.asarray([0.0, 0.0, 0.0]),
+        )
+
+        self.assertLess(abs(square_delta_deg), 1.0)
+        self.assertAlmostEqual(square_error_deg, 0.0, places=6)
+        self.assertGreater(abs(rectangular_delta_deg), 80.0)
 
     def test_primary_and_secondary_placement_share_the_same_d_center(self) -> None:
         primary = SuctionCupSpec(

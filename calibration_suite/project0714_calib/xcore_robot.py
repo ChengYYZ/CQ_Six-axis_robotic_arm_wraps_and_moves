@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -236,6 +236,20 @@ class XCoreRobotClient:
             elbow=float(posture.elbow),
         )
 
+    def read_current_joints_rad(self) -> np.ndarray:
+        """Read the actual robot joint angles used by an absolute-joint restore."""
+        self.connect()
+        joints = _sdk_call(
+            self.xcore,
+            "jointPos",
+            self.ec,
+            self.robot.jointPos,
+        )
+        result = np.asarray(joints, dtype=np.float64)
+        if result.ndim != 1 or result.size == 0 or not np.all(np.isfinite(result)):
+            raise RuntimeError(f"Robot returned invalid joint positions: {joints!r}")
+        return result
+
     def set_toolset_by_name(self, tool_name: str, wobj_name: str = "wobj0") -> ToolsetInfo:
         self.connect()
         self._toolset = _sdk_call(
@@ -302,6 +316,11 @@ class XCoreRobotClient:
             opts, (x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg)
         )
         self.prepare_motion(opts.speed_mm_s, opts.zone_mm)
+        # xCore has a controller-wide configuration-solving switch in addition
+        # to CartesianPosition.confData. Keep both in sync for every command so
+        # a preceding auto-conf MoveJ cannot leak into a current-conf MoveL (or
+        # vice versa).
+        self.set_conf_data_forced(opts.use_current_conf_data)
         current = self.read_current_pose()
         target = self._build_target_pose(
             current,
@@ -348,6 +367,48 @@ class XCoreRobotClient:
             )
         return final_pose
 
+    def move_to_joint_positions_rad(
+        self,
+        joints_rad: np.ndarray | list[float] | tuple[float, ...],
+        options: MotionOptions | None = None,
+    ) -> RobotPose:
+        """Move to one exact saved joint configuration with MoveAbsJ."""
+        opts = options or MotionOptions(motion="movej")
+        target = np.asarray(joints_rad, dtype=np.float64)
+        if target.ndim != 1 or target.size == 0 or not np.all(np.isfinite(target)):
+            raise ValueError("Joint target must be a non-empty finite one-dimensional array.")
+        current = self.read_current_joints_rad()
+        if current.shape != target.shape:
+            raise ValueError(
+                f"Joint target length {target.size} does not match robot joint length {current.size}."
+            )
+
+        self.prepare_motion(opts.speed_mm_s, opts.zone_mm)
+        _sdk_call(self.xcore, "moveReset", self.ec, self.robot.moveReset)
+        command = self.xcore.MoveAbsJCommand(
+            target.tolist(), opts.speed_mm_s, opts.zone_mm
+        )
+        cmd_id = self.xcore.PyString()
+        _sdk_call(self.xcore, "moveAppend", self.ec, self.robot.moveAppend, [command], cmd_id)
+        _sdk_call(self.xcore, "moveStart", self.ec, self.robot.moveStart)
+
+        started = self._wait_until_started(min(opts.timeout_s, 3.0), opts.stop_requested)
+        self._wait_until_idle(opts.timeout_s, opts.stop_requested)
+        final_joints = self.read_current_joints_rad()
+        max_joint_error_deg = float(
+            np.max(np.abs(np.degrees(final_joints - target)))
+        )
+        event_info = self._query_move_event()
+        if (not started and max_joint_error_deg > 0.2) or max_joint_error_deg > 1.0:
+            raise RuntimeError(
+                "Robot absolute-joint command did not restore the saved configuration.\n"
+                f"Command id: {self._pystring_content(cmd_id)}\n"
+                f"Started moving: {started}\n"
+                f"Maximum joint error: {max_joint_error_deg:.2f} deg\n"
+                f"Move event: {self._format_move_event(event_info)}"
+            )
+        return self.read_current_pose()
+
     def move_linear_path_mm_deg(
         self,
         poses_mm_deg: list[tuple[float, float, float, float, float, float, float]],
@@ -360,6 +421,7 @@ class XCoreRobotClient:
         for pose in poses_mm_deg:
             self._validate_motion_request(opts, pose[:6])
         self.prepare_motion(opts.speed_mm_s, opts.zone_mm)
+        self.set_conf_data_forced(opts.use_current_conf_data)
         current = self.read_current_pose()
 
         targets = [
@@ -395,6 +457,76 @@ class XCoreRobotClient:
         orientation_error_deg = self._pose_orientation_distance_deg(final_pose, final_target)
         event_info = self._query_move_event()
 
+        if (
+            (not started and position_error_mm > 2.0)
+            or position_error_mm > 10.0
+            or orientation_error_deg > 5.0
+        ):
+            raise RuntimeError(
+                "Robot path command did not reach the final target pose.\n"
+                f"Command id: {self._pystring_content(cmd_id)}\n"
+                f"Started moving: {started}\n"
+                f"Final position error: {position_error_mm:.2f} mm\n"
+                f"Final orientation error: {orientation_error_deg:.2f} deg\n"
+                f"Move event: {self._format_move_event(event_info)}"
+            )
+        return final_pose
+
+    def move_path_mm_deg(
+        self,
+        poses_mm_deg: list[
+            tuple[float, float, float, float, float, float, str, float]
+        ],
+        options: MotionOptions | None = None,
+    ) -> RobotPose:
+        """Execute mixed MoveJ/MoveL Cartesian targets in one controller queue."""
+        if not poses_mm_deg:
+            raise ValueError("No path poses were provided.")
+
+        opts = options or MotionOptions()
+        for pose in poses_mm_deg:
+            motion = str(pose[6]).lower()
+            self._validate_motion_request(replace(opts, motion=motion), pose[:6])
+            if not np.isfinite(pose[7]) or pose[7] < 0.0:
+                raise ValueError("Path zone must be a non-negative finite value.")
+        self.prepare_motion(opts.speed_mm_s, opts.zone_mm)
+        self.set_conf_data_forced(opts.use_current_conf_data)
+        current = self.read_current_pose()
+        targets = [
+            self._build_target_pose(
+                current,
+                x_mm,
+                y_mm,
+                z_mm,
+                rx_deg,
+                ry_deg,
+                rz_deg,
+                opts.use_current_conf_data,
+            )
+            for x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg, _motion, _zone_mm in poses_mm_deg
+        ]
+        for target in targets:
+            self._precheck_target_pose(target)
+
+        commands = []
+        for target, (*_pose, motion, zone_mm) in zip(targets, poses_mm_deg):
+            if str(motion).lower() == "movel":
+                commands.append(self.xcore.MoveLCommand(target, opts.speed_mm_s, zone_mm))
+            else:
+                commands.append(self.xcore.MoveJCommand(target, opts.speed_mm_s, zone_mm))
+
+        cmd_id = self.xcore.PyString()
+        _sdk_call(self.xcore, "moveReset", self.ec, self.robot.moveReset)
+        _sdk_call(self.xcore, "moveAppend", self.ec, self.robot.moveAppend, commands, cmd_id)
+        _sdk_call(self.xcore, "moveStart", self.ec, self.robot.moveStart)
+
+        started = self._wait_until_started(min(opts.timeout_s, 3.0), opts.stop_requested)
+        self._wait_until_idle(opts.timeout_s, opts.stop_requested)
+        final_pose = self.read_current_pose()
+        final_target = targets[-1]
+        position_error_mm = self._pose_distance_mm(final_pose, final_target)
+        orientation_error_deg = self._pose_orientation_distance_deg(final_pose, final_target)
+        event_info = self._query_move_event()
         if (
             (not started and position_error_mm > 2.0)
             or position_error_mm > 10.0

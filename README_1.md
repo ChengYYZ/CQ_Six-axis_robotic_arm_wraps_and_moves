@@ -231,6 +231,28 @@ project_yolo_train_0804\runs\yolo11s_obb_train-4\weights\best2.pt
 5. 根据工作空间、法向、平整度、点数等条件过滤运动风险。
 6. 点击单个候选或按 Enter 执行批量抓取。
 
+### 采集空平台 RGB-D 基准
+
+包裹清空后可单独采集平台深度基准；此脚本只连接 Orbbec 相机，不连接或移动机器人。先关闭正在运行的抓取程序，然后执行：
+
+```powershell
+.\.venv\Scripts\python.exe calibration_suite\capture_empty_platform.py --frames 40 --align-mode sw
+```
+
+在弹出的彩色画面中沿平台边缘左键圈出多边形，按 `c` 或 `Enter` 确认。采集期间保持平台和相机固定；结果写入 `calibration_suite\workspace\empty_platform_baselines\empty_platform_时间戳\`，包括：
+
+- `empty_platform_depth_mm.npy`：逐像素中值深度，单位 mm；无效或 ROI 外设为 0。
+- `empty_platform_camera_mm.ply`：相机坐标系下的彩色平台点云。
+- `empty_platform_base_mm.ply`：经现有手眼变换后的机器人基坐标系点云。
+- `empty_platform_rgb.png`、`platform_roi_mask.png`、`empty_platform_depth_preview.png`：采集和 ROI 预览。
+- `manifest.json`：内参、手眼变换、ROI、对齐方式和采集参数。
+
+默认采集 40 帧，对每个像素取有效深度中值；至少 60% 帧有有效深度才会进入基准。需要保留全部原始对齐深度帧时加 `--save-raw-frames`。
+
+主抓取程序默认自动加载最新基准，并检查采集时的对齐模式、相机内参、手眼变换和图像尺寸是否与当前配置一致。YOLO 候选会逐像素与空平台深度比较，将深度差转换为机器人基坐标系的竖直凸起高度；凸起高度不足 `--platform-baseline-min-height-mm`（默认 12 mm）、候选框凸起点比例不足 `--platform-baseline-min-coverage`（默认 20%），或候选框没有足够基准覆盖时，会在抓取规划前被过滤。运行日志会列出所用基准路径及 `baseline_coverage`、`baseline_height` 拒绝计数。
+
+相机或平台位置变化后要重新采集空平台基准。需手动指定基准时可用 `--empty-platform-baseline <depth.npy 或采集目录>`；仅做对照运行并关闭该过滤时使用 `--empty-platform-baseline off`。
+
 窗口按键：
 
 - 鼠标左键：选择并执行一个安全候选
